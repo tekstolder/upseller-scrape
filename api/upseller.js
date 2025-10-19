@@ -327,51 +327,86 @@ module.exports = async function handler(req, res) {
       return !!(hasTable || hasStat);
     }, null, { timeout: 8000 }).catch(() => {});
 
-    // KPIs
-    const kpis = await page.evaluate(() => {
-      function pickText(el) { return (el && (el.textContent || '') || '').trim(); }
-      const out = {};
-      // estatísticas
-      document.querySelectorAll('.ant-statistic').forEach((card) => {
-        const label = pickText(card.querySelector('.ant-statistic-title')) || pickText(card.previousElementSibling);
-        const valTxt = pickText(card.querySelector('.ant-statistic-content, .ant-statistic-content-value'));
-        if (label && valTxt) out[label.toLowerCase()] = valTxt;
-      });
-      // cards
-      document.querySelectorAll('.ant-card .ant-card-meta-title, .ant-card-head-title').forEach((el) => {
-        const lbl = pickText(el);
-        const valTxt = pickText(el.closest('.ant-card')?.querySelector('.ant-statistic-content, .ant-typography, .ant-card-meta-description'));
-        if (lbl && valTxt) out[lbl.toLowerCase()] = valTxt;
-      });
-      // normaliza chaves
-      const normalized = {};
-      Object.entries(out).forEach(([k, v]) => {
-        const key = k.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
-        normalized[key] = v;
-      });
-      return normalized;
-    });
+// === COLETA DA TABELA (Top-7 MELI + Top-7 SPEE) ===
 
-    // Tabela (amostra)
-    const tableSample = await page.evaluate(() => {
-      const table = document.querySelector('.ant-table');
-      if (!table) return null;
-      const rows = Array.from(table.querySelectorAll('tbody tr')).slice(0, 10).map(tr =>
-        Array.from(tr.querySelectorAll('td')).map(td => (td.textContent || '').trim())
-      );
-      const headers = Array.from(table.querySelectorAll('thead th')).map(th => (th.textContent || '').trim());
-      return { headers, rows };
-    });
+// Converte número em PT-BR ("1.234,56") -> 1234.56
+function brToNumber(txt = "") {
+  const s = (txt || "").toString().trim().replace(/\./g, "").replace(",", ".");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
+}
 
-    const tookMs = Date.now() - started;
-    return json(res, 200, {
-      ok: true,
-      period: { from: range.from, to: range.to },
-      page: { title: await page.title().catch(() => null), url: page.url() },
-      kpis,
-      tableSample,
-      tookMs
-    });
+// Lê tabela visível e coleta colunas
+async function parseSalesTable(page) {
+  await page.waitForSelector(".ant-table-content table", { timeout: 15000 });
+  const headers = await page.$$eval(".ant-table-content table thead th",
+    ths => ths.map(th => th.textContent?.trim() || "")
+  );
+  const idxLoja = headers.findIndex(h => h.toLowerCase().includes("loja"));
+  const idxPV   = headers.findIndex(h => h.toLowerCase().includes("pedidos válidos"));
+  const idxVVV  = headers.findIndex(h => h.toLowerCase().includes("valor de vendas válidas"));
+  if (idxLoja < 0 || idxPV < 0 || idxVVV < 0)
+    throw new Error("Colunas esperadas não encontradas.");
+
+  const rows = await page.$$eval(".ant-table-content table tbody tr",
+    (trs, {idxLoja, idxPV, idxVVV}) => {
+      const getMainText = (cell) => (cell?.innerText?.split("\n")[0] || "").trim();
+      return Array.from(trs).map(tr => {
+        const tds = Array.from(tr.querySelectorAll("td"));
+        return {
+          loja: getMainText(tds[idxLoja]),
+          pedidosValidos: tds[idxPV]?.innerText?.trim() || "0",
+          vvv: tds[idxVVV]?.innerText?.trim() || "0"
+        };
+      });
+    }, { idxLoja, idxPV, idxVVV }
+  );
+
+  return rows
+    .map(r => ({
+      loja: r.loja,
+      pedidosValidos: brToNumber(r.pedidosValidos),
+      valorVendasValidas: brToNumber(r.vvv),
+    }))
+    .filter(r => r.loja);
+}
+
+// Agrupa e ordena
+async function scrapeTopByGroup(page) {
+  const all = await parseSalesTable(page);
+  const isMeli = n => /^MELI\b/i.test(n);
+  const isSpee = n => /^SPEE\b/i.test(n);
+  const pickTop = (arr) => arr.sort((a,b)=>b.valorVendasValidas-a.valorVendasValidas).slice(0,7);
+  const format = r => ({
+    Loja: r.loja,
+    "Pedidos Válidos": r.pedidosValidos,
+    "Valor de Vendas Válidas": r.valorVendasValidas
+  });
+
+  const meli = pickTop(all.filter(r=>isMeli(r.loja))).map(format);
+  const spee = pickTop(all.filter(r=>isSpee(r.loja))).map(format);
+
+  return {
+    grupos: { Meli: meli, SPEE: spee },
+    totais: {
+      Meli: meli.reduce((s,r)=>s+r["Valor de Vendas Válidas"],0),
+      SPEE: spee.reduce((s,r)=>s+r["Valor de Vendas Válidas"],0)
+    }
+  };
+}
+
+// Executa coleta
+const resultado = await scrapeTopByGroup(page);
+
+const tookMs = Date.now() - started;
+return json(res, 200, {
+  ok: true,
+  period: { from: range.from, to: range.to },
+  page: { title: await page.title().catch(() => null), url: page.url() },
+  grupos: resultado.grupos,
+  totais: resultado.totais,
+  tookMs
+});
 
   } catch (err) {
     const took = Date.now() - started;
