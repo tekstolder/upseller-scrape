@@ -1,420 +1,277 @@
-'use strict';
-
-// Vercel (Node 20, CommonJS)
+// api/upseller.js
 const { chromium } = require('playwright-core');
 
-/* -------------------------- Helpers -------------------------- */
-function json(res, code, obj) {
-  res.status(code).setHeader('content-type', 'application/json; charset=utf-8');
-  res.end(JSON.stringify(obj));
-}
-
-function buildDateStrings({ d, m, y }) {
-  const dd = String(d || '').padStart(2, '0');
-  const mm = String(m || '').padStart(2, '0');
-  const yyyy = String(y || '');
-  if (dd.length !== 2 || mm.length !== 2 || yyyy.length !== 4) {
-    throw new Error('Parâmetros de data inválidos. Use ?d=DD&m=MM&y=YYYY');
+/** Utilidades -------------------------------------------------------------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const json = (res, status, data) => {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(data, null, 2));
+};
+const getWs = () => {
+  let ws = process.env.BROWSERLESS_WS || '';
+  // aceita wss://production-xxx.browserless.io e wss://.../chromium
+  if (ws && !/\/chromium($|\?)/.test(ws)) {
+    // se já vier com query (?token=...), mantemos
+    const [base, q] = ws.split('?');
+    ws = `${base.replace(/\/+$/, '')}/chromium${q ? `?${q}` : ''}`;
   }
-  return { from: `${dd}/${mm}/${yyyy}`, to: `${dd}/${mm}/${yyyy}`, dd, mm, yyyy };
-}
+  return ws;
+};
 
-function readEnvs() {
-  const WS = process.env.BROWSERLESS_WS || '';
-  const RAW = process.env.UPS_COOKIES_JSON || '';
-  if (!WS) throw new Error('BROWSERLESS_WS ausente');
-  if (!RAW) throw new Error('UPS_COOKIES_JSON ausente');
-  const trimmed = RAW.trim().replace(/^"+|"+$/g, '');
-  let cookies;
-  try { cookies = JSON.parse(trimmed); } catch { throw new Error('UPS_COOKIES_JSON não é um JSON válido de array'); }
-  if (!Array.isArray(cookies)) throw new Error('UPS_COOKIES_JSON deve ser um array JSON');
-  return { WS, cookies };
-}
-
-function normalizeCookies(cookies) {
-  return cookies.map((c) => ({
-    domain: c.domain || 'app.upseller.com',
-    path: c.path || '/',
-    httpOnly: !!c.httpOnly,
-    secure: c.secure !== false,
-    sameSite: typeof c.sameSite === 'string' ? c.sameSite : 'Lax',
-    name: c.name, value: c.value,
-  })).filter((c) => c && c.name && c.value);
-}
-
-function swapRegion(url, from, to) {
-  return url.includes(from) ? url.replace(from, to) : url;
-}
-
-async function connectWithRetryAndFallback(primaryWs, triesPerRegion = 2) {
-  const candidates = [
-    primaryWs,
-    swapRegion(primaryWs, 'production-sfo.', 'production-ams.'),
-    swapRegion(primaryWs, 'production-ams.', 'production-sfo.'),
-  ].filter(Boolean);
-
-  let lastErr;
-  for (const ws of candidates) {
-    for (let i = 0; i < triesPerRegion; i++) {
-      try {
-        return await chromium.connectOverCDP(ws);
-      } catch (err) {
-        lastErr = err;
-        const msg = String(err && err.message || err);
-        const is429 = /429|Too Many Requests/i.test(msg);
-        const isConn = /WebSocket|connect|closed before/i.test(msg);
-        const waitMs = Math.floor((800 * Math.pow(2, i)) + Math.random()*400);
-        if (is429 || isConn) await new Promise(r => setTimeout(r, waitMs));
-        else throw err;
-      }
-    }
-  }
-  throw lastErr;
-}
-
-/* ------------------ Calendar helpers (Ant Design) ------------------ */
-async function waitDropdown(page) {
-  const dd = await page.waitForSelector(
-    '.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container, [role="dialog"]',
-    { timeout: 4000 }
-  ).catch(() => null);
-  if (!dd) throw new Error('Dropdown do calendário não abriu');
-}
-
-async function ensureMonthYear(page, y, m) {
-  // Tenta detectar mês/ano atuais em ambos os painéis (esquerdo/direito)
-  // e usa header prev/next até chegar no alvo.
-  const alvo = { y: Number(y), m: Number(m) }; // 1..12
-  const maxSteps = 24; // limite de iterações
-
-  function monthIndexPT(txt) {
-    const t = (txt || '').toLowerCase();
-    const nomes = ['janeiro','fevereiro','mar','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'];
-    for (let i = 0; i < nomes.length; i++) {
-      if (t.includes(nomes[i])) {
-        // 'mar' cobre 'março'
-        if (nomes[i] === 'mar' && !t.includes('mar')) continue;
-        return i % 12; // 0..11
-      }
-    }
-    return -1;
-  }
-
-  for (let step = 0; step < maxSteps; step++) {
-    const pos = await page.evaluate(() => {
-      function readPanel(root) {
-        if (!root) return null;
-        const mBtn = root.querySelector('.ant-picker-month-btn, .ant-calendar-month-select');
-        const yBtn = root.querySelector('.ant-picker-year-btn, .ant-calendar-year-select');
-        const mt = (mBtn?.textContent || '').trim();
-        const yt = (yBtn?.textContent || '').trim();
-        return { mt, yt };
-      }
-      const dd = document.querySelector('.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container') || document;
-      const panels = Array.from(dd.querySelectorAll('.ant-picker-panel'));
-      const legacyLeft  = dd.querySelector('.ant-calendar-range-left');
-      const legacyRight = dd.querySelector('.ant-calendar-range-right');
-      const L = panels[0] || legacyLeft;
-      const R = panels[1] || legacyRight;
-      return { left: readPanel(L), right: readPanel(R) };
-    });
-
-    const candidates = [pos.left, pos.right].filter(Boolean);
-    let found = false;
-    for (const p of candidates) {
-      const mi = monthIndexPT(p.mt);
-      const yy = parseInt(p.yt, 10);
-      if (mi >= 0 && yy) {
-        const cur = { y: yy, m: mi + 1 };
-        if (cur.y === alvo.y && cur.m === alvo.m) {
-          found = true; break;
-        }
-      }
-    }
-    if (found) return;
-
-    // decide ir para trás ou frente: se ano/mes alvo é anterior ao atual (primeiro painel)
-    const goPrev = await page.evaluate(({ monthIndexPTStr, alvo }) => {
-      function monthIndexPT(txt) {
-        const t = (txt || '').toLowerCase();
-        const nomes = ['janeiro','fevereiro','mar','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'];
-        for (let i = 0; i < nomes.length; i++) {
-          if (t.includes(nomes[i])) return i % 12;
-        }
-        return -1;
-      }
-      const dd = document.querySelector('.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container') || document;
-      const panel = dd.querySelector('.ant-picker-panel') || dd;
-      const mBtn = panel.querySelector('.ant-picker-month-btn, .ant-calendar-month-select');
-      const yBtn = panel.querySelector('.ant-picker-year-btn, .ant-calendar-year-select');
-      const mi = monthIndexPT(mBtn?.textContent || '');
-      const yy = parseInt(yBtn?.textContent || '0', 10);
-      if (!yy || mi < 0) return false;
-      // comparar curr (yy, mi+1) com alvo (y, m)
-      if (yy > alvo.y) return true;
-      if (yy < alvo.y) return false;
-      // mesmo ano
-      return (mi + 1) > alvo.m;
-    }, { monthIndexPTStr: monthIndexPT.toString(), alvo });
-
-    const btnSel = goPrev
-      ? '.ant-picker-header-prev-btn, .ant-calendar-prev-month-btn'
-      : '.ant-picker-header-next-btn, .ant-calendar-next-month-btn';
-    const btn = await page.$(btnSel);
-    if (btn) await btn.click({ delay: 10 });
-    await page.waitForTimeout(200);
-  }
-
-  throw new Error('Não foi possível posicionar mês/ano no calendário');
-}
-
-async function clickDayTwice(page, d) {
-  // Seleciona o dia no(s) painel(is) visíveis (novo e legado)
-  const dia = String(parseInt(d, 10));
-  // tenta no painel novo
-  const selNew = `.ant-picker-cell-in-view .ant-picker-cell-inner:text-is("${dia}")`;
-  const elNew = await page.$(selNew).catch(() => null);
-  if (elNew) {
-    await elNew.click();
-    await page.waitForTimeout(250);
-    await elNew.click();
-    return 'new';
-  }
-  // tenta no legado
-  const selOld = `.ant-calendar-date:text-is("${dia}")`;
-  const elOld = await page.$(selOld).catch(() => null);
-  if (elOld) {
-    await elOld.click();
-    await page.waitForTimeout(250);
-    await elOld.click();
-    return 'old';
-  }
-  // fallback: procura por células de dia e compara texto
-  const ok = await page.evaluate((dia) => {
-    const cells = Array.from(document.querySelectorAll('.ant-picker-cell-inner, .ant-calendar-date'));
-    const alvo = cells.find(el => (el.textContent || '').trim() === dia);
-    if (!alvo) return false;
-    alvo.click(); setTimeout(() => alvo.click(), 250);
-    return true;
-  }, dia);
-  if (ok) return 'fallback';
-  throw new Error(`Dia ${dia} não encontrado no calendário`);
-}
-
-/* -------------------------- Core -------------------------- */
-module.exports = async function handler(req, res) {
-  const started = Date.now();
-  let browser, context, page;
-
-  const mode = (req.query.mode || '').toString().toLowerCase();
-  if (mode === 'ping') {
-    try {
-      const { WS } = readEnvs();
-      return json(res, 200, { ok: true, ping: 'alive', hasWS: !!WS });
-    } catch (err) {
-      return json(res, 200, { ok: false, error: String(err && err.message || err) });
-    }
-  }
-
-  let range = null;
-  try { range = buildDateStrings({ d: req.query.d, m: req.query.m, y: req.query.y }); }
-  catch (_) { if (mode !== 'html') return json(res, 200, { ok: false, error: 'Parâmetros d/m/y obrigatórios (?d=DD&m=MM&y=YYYY)' }); }
-
-  try {
-    const { WS, cookies } = readEnvs();
-    const normCookies = normalizeCookies(cookies);
-
-    browser = await connectWithRetryAndFallback(WS, 2);
-    context = browser.contexts()[0] || await browser.newContext({ ignoreHTTPSErrors: true });
-    if (normCookies.length) { try { await context.addCookies(normCookies); } catch {} }
-
-    page = await context.newPage();
-    page.setDefaultTimeout(25000);
-
-    const targetUrl = 'https://app.upseller.com/pt/analytics/store-sales';
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForLoadState('load', { timeout: 20000 });
-    await page.waitForFunction(
-      () => document.readyState === 'complete' || document.title.toLowerCase().includes('upseller'),
-      null, { timeout: 15000 }
-    );
-
-    if (mode === 'html') {
-      const html = await page.content();
-      const out = { ok: true, diag: { title: await page.title().catch(() => null), url: page.url(), len: html.length }, html };
-      try { await browser.close(); } catch {}
-      return json(res, 200, out);
-    }
-
-    // -------- abrir o datepicker --------
-    await page.waitForFunction(() => {
-      const q = (sel) => document.querySelector(sel);
-      const has =
-        q('.ant-picker') || q('.ant-calendar-picker') || q('.ant-picker-range') ||
-        q('.ant-picker-input input') || q('[data-testid*="date"]') ||
-        q('input[placeholder*="Data"]') || q('[class*="date"]') || q('[class*="calendar"]');
-      return has && document.readyState === 'complete';
-    }, null, { timeout: 15000 });
-    await page.waitForTimeout(200);
-
-    const openerSelectors = [
-      '.ant-calendar-picker',
-      '.ant-picker-input input',
-      '.ant-picker-range',
-      '.ant-picker',
-      '[data-testid="date-picker"]',
-      'input[placeholder*="Data"]',
-      "button[aria-label*='Data']",
-    ];
-    let opened = false;
-    for (let attempt = 0; attempt < 2 && !opened; attempt++) {
-      try {
-        for (const sel of openerSelectors) {
-          const el = await page.$(sel);
-          if (!el) continue;
-          await el.click({ delay: 10 });
-          const dd = await page.waitForSelector(
-            '.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container, [role="dialog"]',
-            { timeout: 1500 }
-          ).catch(() => null);
-          if (dd) { opened = true; break; }
-        }
-        if (!opened) throw new Error('Datepicker não encontrado');
-      } catch (err) {
-        if (String(err).includes('Execution context was destroyed')) {
-          await page.waitForLoadState('load', { timeout: 8000 }).catch(() => {});
-          await page.waitForTimeout(500);
-          continue;
-        }
-        throw err;
-      }
-    }
-    if (!opened) return json(res, 200, { ok: false, error: 'Datepicker não encontrado' });
-
-    // -------- se não há inputs, navega mês/ano e clica dia duas vezes --------
-    let inputs = await page.$$('.ant-picker-dropdown .ant-picker-input input');
-    if (inputs.length < 2) inputs = await page.$$('.ant-picker-panel .ant-picker-input input');
-    if (inputs.length >= 2) {
-      // há inputs: preenche normalmente
-      const startInput = inputs[0];
-      const endInput = inputs[1] || inputs[0];
-      async function typeOrSet(el, value) {
-        try { await el.click({ clickCount: 3 }); await page.keyboard.type(value); return 'typed'; }
-        catch { await page.evaluate((e, v) => { e.value = v; e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); }, el, value); return 'setValue'; }
-      }
-      await typeOrSet(startInput, range.from);
-      await page.waitForTimeout(120);
-      await typeOrSet(endInput, range.to);
-    } else {
-      // sem inputs → usa clique na célula (navegando pro mês/ano)
-      await ensureMonthYear(page, range.yyyy, range.mm);
-      await clickDayTwice(page, range.dd);
-    }
-
-    // aplica: Enter ou botão OK
-    let applied = false;
-    try { await page.keyboard.press('Enter'); applied = true; } catch {}
-    if (!applied) {
-      const okBtn = await page.$('.ant-picker-dropdown .ant-picker-ok button, .ant-calendar-ok-btn');
-      if (okBtn) { await okBtn.click().catch(() => {}); applied = true; }
-    }
-
-    // espera painel atualizar
-    await page.waitForTimeout(1000);
-    await page.waitForFunction(() => {
-      const hasTable = document.querySelector('.ant-table, [class*="table"]');
-      const hasStat = document.querySelector('.ant-statistic, [class*="statistic"]');
-      return !!(hasTable || hasStat);
-    }, null, { timeout: 8000 }).catch(() => {});
-
-// === COLETA DA TABELA (Top-7 MELI + Top-7 SPEE) ===
-
-// Converte número em PT-BR ("1.234,56") -> 1234.56
-function brToNumber(txt = "") {
-  const s = (txt || "").toString().trim().replace(/\./g, "").replace(",", ".");
+// pt-BR: "3.683,65" -> 3683.65
+function brToNumber(txt) {
+  if (txt == null) return 0;
+  const s = String(txt).replace(/\./g, '').replace(',', '.').replace(/[^\d.-]/g, '');
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
 
-// Lê tabela visível e coleta colunas
-async function parseSalesTable(page) {
-  await page.waitForSelector(".ant-table-content table", { timeout: 15000 });
-  const headers = await page.$$eval(".ant-table-content table thead th",
-    ths => ths.map(th => th.textContent?.trim() || "")
-  );
-  const idxLoja = headers.findIndex(h => h.toLowerCase().includes("loja"));
-  const idxPV   = headers.findIndex(h => h.toLowerCase().includes("pedidos válidos"));
-  const idxVVV  = headers.findIndex(h => h.toLowerCase().includes("valor de vendas válidas"));
-  if (idxLoja < 0 || idxPV < 0 || idxVVV < 0)
-    throw new Error("Colunas esperadas não encontradas.");
+/** Seleciona o range de datas (dois inputs) -------------------------------- */
+async function setDateRange(page, fromBr, toBr) {
+  // abre o datepicker (tenta seletores antigos e novos)
+  const openerSelectors = [
+    '.ant-picker',
+    '.ant-calendar-picker',
+    '.ant-picker-range'
+  ];
 
-  const rows = await page.$$eval(".ant-table-content table tbody tr",
-    (trs, {idxLoja, idxPV, idxVVV}) => {
-      const getMainText = (cell) => (cell?.innerText?.split("\n")[0] || "").trim();
-      return Array.from(trs).map(tr => {
-        const tds = Array.from(tr.querySelectorAll("td"));
-        return {
-          loja: getMainText(tds[idxLoja]),
-          pedidosValidos: tds[idxPV]?.innerText?.trim() || "0",
-          vvv: tds[idxVVV]?.innerText?.trim() || "0"
-        };
-      });
-    }, { idxLoja, idxPV, idxVVV }
-  );
+  let opened = false;
+  for (const sel of openerSelectors) {
+    const el = await page.$(sel);
+    if (el) {
+      await el.click({ delay: 10 });
+      opened = true;
+      break;
+    }
+  }
+  if (!opened) throw new Error('Datepicker não encontrado');
 
-  return rows
-    .map(r => ({
-      loja: r.loja,
-      pedidosValidos: brToNumber(r.pedidosValidos),
-      valorVendasValidas: brToNumber(r.vvv),
-    }))
-    .filter(r => r.loja);
+  // garante que os inputs renderizaram
+  // novos: .ant-picker-input input
+  // antigos: .ant-calendar-range-picker-input
+  let inputs = await page.$$('.ant-picker-input input');
+  if (!inputs || inputs.length < 2) {
+    inputs = await page.$$('.ant-calendar-range-picker-input');
+  }
+  if (!inputs || inputs.length < 2) {
+    throw new Error('Inputs do date-range não encontrados');
+  }
+
+  // preenche os dois inputs (Ctrl/Meta + A) e Enter para aplicar
+  for (let i = 0; i < 2; i++) {
+    await inputs[i].click({ clickCount: 3 });
+    await page.keyboard.press('ControlOrMeta+A');
+    await page.keyboard.type(i === 0 ? fromBr : toBr, { delay: 20 });
+  }
+  await page.keyboard.press('Enter');
+
+  // aguarda a tabela recarregar / DOM estabilizar
+  await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+  // pequena folga para requests internas
+  await sleep(1200);
 }
 
-// Agrupa e ordena
-async function scrapeTopByGroup(page) {
-  const all = await parseSalesTable(page);
-  const isMeli = n => /^MELI\b/i.test(n);
-  const isSpee = n => /^SPEE\b/i.test(n);
-  const pickTop = (arr) => arr.sort((a,b)=>b.valorVendasValidas-a.valorVendasValidas).slice(0,7);
-  const format = r => ({
-    Loja: r.loja,
-    "Pedidos Válidos": r.pedidosValidos,
-    "Valor de Vendas Válidas": r.valorVendasValidas
+/** Lê a tabela visível, mapeando cabeçalhos por texto ---------------------- */
+async function parseSalesTable(page) {
+  return await page.evaluate(() => {
+    const norm = (s) =>
+      (s || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+    const table = document.querySelector('.ant-table');
+    if (!table) return { headers: [], rows: [] };
+
+    const headers = Array.from(table.querySelectorAll('thead th')).map((th) =>
+      (th.textContent || '').trim()
+    );
+
+    const headerIndex = {};
+    headers.forEach((h, idx) => {
+      const n = norm(h);
+      if (n.includes('loja')) headerIndex.loja = idx;
+      if (n.includes('pedidos válidos') || n.includes('pedidos validos')) headerIndex.pedidosValidos = idx;
+      if (n.includes('valor de vendas válidas') || n.includes('valor de vendas validas')) headerIndex.valorVendasValidas = idx;
+      if (headerIndex.loja == null && n === 'loja') headerIndex.loja = idx;
+    });
+
+    const rows = Array.from(table.querySelectorAll('tbody tr'))
+      .map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim()))
+      .filter((r) => r.length);
+
+    return { headers, rows, headerIndex };
+  });
+}
+
+/** Agrupa por prefixo (MELI / SPEE), soma e ordena ------------------------- */
+function groupAndTop(data) {
+  // mapeia linhas cruas em objetos fortes
+  const mapped = data.rows.map((cols) => {
+    const loja = cols[data.headerIndex.loja] || '';
+    const pedidosValidosTxt = data.headerIndex.pedidosValidos != null ? cols[data.headerIndex.pedidosValidos] : '0';
+    const valorVendasTxt   = data.headerIndex.valorVendasValidas != null ? cols[data.headerIndex.valorVendasValidas] : '0';
+
+    return {
+      loja,
+      pedidosValidos: Number(String(pedidosValidosTxt).replace(/[^\d]/g, '')) || 0,
+      valorVendasValidas: brToNumber(valorVendasTxt)
+    };
   });
 
-  const meli = pickTop(all.filter(r=>isMeli(r.loja))).map(format);
-  const spee = pickTop(all.filter(r=>isSpee(r.loja))).map(format);
+  // separa por prefixo
+  const meli = mapped.filter((r) => /^MELI\b/i.test(r.loja));
+  const spee = mapped.filter((r) => /^SPEE\b/i.test(r.loja));
+
+  // ordena por valor desc
+  const sortDesc = (a, b) => b.valorVendasValidas - a.valorVendasValidas;
+
+  // pega top 7 de cada
+  const topMeli = meli.sort(sortDesc).slice(0, 7);
+  const topSpee = spee.sort(sortDesc).slice(0, 7);
+
+  // só retorna colunas pedidas
+  const pick = (r) => ({
+    loja: r.loja,
+    pedidosValidos: r.pedidosValidos,
+    valorVendasValidas: r.valorVendasValidas
+  });
 
   return {
-    grupos: { Meli: meli, SPEE: spee },
-    totais: {
-      Meli: meli.reduce((s,r)=>s+r["Valor de Vendas Válidas"],0),
-      SPEE: spee.reduce((s,r)=>s+r["Valor de Vendas Válidas"],0)
-    }
+    meli: topMeli.map(pick),
+    spee: topSpee.map(pick)
   };
 }
 
-// Executa coleta
-const resultado = await scrapeTopByGroup(page);
+/** Handler principal -------------------------------------------------------- */
+module.exports = async (req, res) => {
+  const started = Date.now();
 
-const tookMs = Date.now() - started;
-return json(res, 200, {
-  ok: true,
-  period: { from: range.from, to: range.to },
-  page: { title: await page.title().catch(() => null), url: page.url() },
-  grupos: resultado.grupos,
-  totais: resultado.totais,
-  tookMs
-});
+  // querystring: ?d=DD&m=MM&y=YYYY&mode=...
+  const { d, m, y, mode } = Object.fromEntries(new URL(req.url, 'http://x').searchParams);
+  const from = `${d || '01'}/${m || '01'}/${y || '2025'}`;
+  const to   = `${d || '01'}/${m || '01'}/${y || '2025'}`;
 
+  // diagnósticos rápidos
+  if (mode === 'ping') {
+    const ws = getWs();
+    return json(res, 200, { ok: !!ws, ping: 'alive', hasWS: !!ws });
+  }
+
+  const wsEndpoint = getWs();
+  if (!wsEndpoint) {
+    return json(res, 500, { ok: false, error: 'BROWSERLESS_WS não configurado' });
+  }
+
+  const targetUrl = 'https://app.upseller.com/pt/analytics/store-sales';
+
+  let browser;
+  let context;
+  let page;
+
+  try {
+    browser = await chromium.connectOverCDP(wsEndpoint);
+    // CDP do Chromium geralmente cria 1 contexto persistente
+    context = browser.contexts()[0] || (await browser.newContext?.());
+
+    // injeta cookies (se houver) para já entrar logado
+    const cookiesJson = process.env.UPS_COOKIES_JSON;
+    if (cookiesJson) {
+      try {
+        const raw = JSON.parse(cookiesJson);
+        const cookies = Array.isArray(raw)
+          ? raw
+          : Array.isArray(raw.cookies)
+          ? raw.cookies
+          : [];
+        if (cookies.length) await context.addCookies(cookies);
+      } catch {
+        // se quebrar o JSON, apenas ignora para não interromper
+      }
+    }
+
+    page = await context.newPage();
+
+    // carrega a página
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // diagnóstico de HTML bruto
+    if (mode === 'html') {
+      const html = await page.content();
+      return json(res, 200, {
+        ok: true,
+        diag: {
+          title: await page.title().catch(() => null),
+          url: page.url(),
+          len: html.length
+        },
+        html
+      });
+    }
+
+    // garante título correto e DOM pronto
+    await page.waitForFunction(
+      () =>
+        document.readyState === 'complete' ||
+        (document.title || '').toLowerCase().includes('upseller'),
+      { timeout: 20000 }
+    ).catch(() => {});
+    await sleep(500);
+
+    // aplica período
+    await setDateRange(page, from, to);
+
+    // carrega tabela e mapeia colunas
+    const table = await parseSalesTable(page);
+
+    if (
+      !table ||
+      !table.rows ||
+      !table.rows.length ||
+      table.headerIndex.loja == null ||
+      table.headerIndex.pedidosValidos == null ||
+      table.headerIndex.valorVendasValidas == null
+    ) {
+      return json(res, 200, {
+        ok: true,
+        page: { title: await page.title().catch(() => null), url: page.url() },
+        info: 'Tabela não encontrada ou cabeçalhos ausentes',
+        diag: { headers: table?.headers || [], headerIndex: table?.headerIndex || {} },
+        tookMs: Date.now() - started
+      });
+    }
+
+    // agrupa e ordena
+    const grupos = groupAndTop(table);
+
+    return json(res, 200, {
+      ok: true,
+      period: { from, to },
+      page: { title: await page.title().catch(() => null), url: page.url() },
+      result: {
+        meli: grupos.meli, // top 7 MELI
+        spee: grupos.spee  // top 7 SPEE
+      },
+      diag: {
+        headers: table.headers,
+        headerIndex: table.headerIndex,
+        totalRows: table.rows.length
+      },
+      tookMs: Date.now() - started
+    });
   } catch (err) {
-    const took = Date.now() - started;
-    return json(res, 200, { ok: false, error: String(err && err.message || err), tookMs: took });
-
+    return json(res, 200, {
+      ok: false,
+      error: String(err && err.message || err),
+      tookMs: Date.now() - started
+    });
   } finally {
+    // fecha página/contexto (o Browserless encerra a sessão em seguida)
     try { if (page) await page.close(); } catch {}
-    try { if (context) await context.close(); } catch {}
+    try { if (context && context !== browser.contexts?.[0]) await context.close(); } catch {}
     try { if (browser) await browser.close(); } catch {}
   }
 };
