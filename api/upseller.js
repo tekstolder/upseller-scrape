@@ -173,4 +173,7 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({
       ok: false,
       error: String(e && e.message ? e.message : e),
-      tookM
+      tookMs: Date.now() - t0,
+    });
+  }
+};
