@@ -1,6 +1,6 @@
 'use strict';
 
-// api/upseller.js — Vercel (Node 20, CommonJS)
+// Vercel (Node 20, CommonJS)
 const { chromium } = require('playwright-core');
 
 /* Helpers -------------------------------------------------- */
@@ -16,9 +16,7 @@ function buildDateStrings({ d, m, y }) {
   if (dd.length !== 2 || mm.length !== 2 || yyyy.length !== 4) {
     throw new Error('Parâmetros de data inválidos. Use ?d=DD&m=MM&y=YYYY');
   }
-  const from = `${dd}/${mm}/${yyyy}`;
-  const to = `${dd}/${mm}/${yyyy}`; // range de 1 dia
-  return { from, to };
+  return { from: `${dd}/${mm}/${yyyy}`, to: `${dd}/${mm}/${yyyy}` };
 }
 
 function readEnvs() {
@@ -27,53 +25,28 @@ function readEnvs() {
   if (!WS) throw new Error('BROWSERLESS_WS ausente');
   if (!RAW) throw new Error('UPS_COOKIES_JSON ausente');
 
-  // Remove aspas acidentais em volta do JSON
   const trimmed = RAW.trim().replace(/^"+|"+$/g, '');
   let cookies;
-  try {
-    cookies = JSON.parse(trimmed);
-  } catch {
-    throw new Error('UPS_COOKIES_JSON não é um JSON válido de array');
-  }
+  try { cookies = JSON.parse(trimmed); } catch { throw new Error('UPS_COOKIES_JSON não é um JSON válido de array'); }
   if (!Array.isArray(cookies)) throw new Error('UPS_COOKIES_JSON deve ser um array JSON');
   return { WS, cookies };
 }
 
 function normalizeCookies(cookies) {
-  return cookies
-    .map((c) => ({
-      domain: c.domain || 'app.upseller.com',
-      path: c.path || '/',
-      httpOnly: !!c.httpOnly,
-      secure: c.secure !== false, // default true
-      sameSite: typeof c.sameSite === 'string' ? c.sameSite : 'Lax',
-      name: c.name,
-      value: c.value,
-    }))
-    .filter((c) => c && c.name && c.value);
+  return cookies.map((c) => ({
+    domain: c.domain || 'app.upseller.com',
+    path: c.path || '/',
+    httpOnly: !!c.httpOnly,
+    secure: c.secure !== false,
+    sameSite: typeof c.sameSite === 'string' ? c.sameSite : 'Lax',
+    name: c.name, value: c.value,
+  })).filter((c) => c && c.name && c.value);
 }
 
-async function waitVisible(page, selectors, timeout = 8000) {
-  const tried = [];
-  for (const sel of selectors) {
-    try {
-      const el = await page.waitForSelector(sel, { visible: true, timeout });
-      if (el) return { el, sel };
-    } catch {
-      tried.push(sel);
-    }
-  }
-  const err = new Error('Nenhum seletor ficou visível');
-  err.meta = { tried };
-  throw err;
-}
-
-/* Conexão WS com retry + fallback de região ---------------- */
 function swapRegion(url, from, to) {
   return url.includes(from) ? url.replace(from, to) : url;
 }
-
-async function connectWithRetryAndFallback(primaryWs, triesPerRegion = 3) {
+async function connectWithRetryAndFallback(primaryWs, triesPerRegion = 2) {
   const candidates = [
     primaryWs,
     swapRegion(primaryWs, 'production-sfo.', 'production-ams.'),
@@ -90,10 +63,9 @@ async function connectWithRetryAndFallback(primaryWs, triesPerRegion = 3) {
         const msg = String(err && err.message || err);
         const is429 = /429|Too Many Requests/i.test(msg);
         const isConn = /WebSocket|connect|closed before/i.test(msg);
-        // backoff progressivo com jitter leve
-        const waitMs = Math.floor((1000 * Math.pow(2, i)) + Math.random() * 500);
+        const waitMs = Math.floor((800 * Math.pow(2, i)) + Math.random()*400);
         if (is429 || isConn) await new Promise(r => setTimeout(r, waitMs));
-        else throw err; // erro "real"
+        else throw err;
       }
     }
   }
@@ -104,34 +76,25 @@ async function connectWithRetryAndFallback(primaryWs, triesPerRegion = 3) {
 module.exports = async function handler(req, res) {
   const started = Date.now();
   let browser, context, page;
+  const diag = { steps: [], openerCandidates: [], openerClicked: null, dropdownDetected: false };
 
   try {
-    // Modos de diagnóstico
     const mode = (req.query.mode || '').toString().toLowerCase();
     if (mode === 'ping') {
       const { WS } = readEnvs();
       return json(res, 200, { ok: true, ping: 'alive', hasWS: !!WS });
     }
 
-    // Datas (para fluxo normal)
     let range = null;
-    try {
-      range = buildDateStrings({ d: req.query.d, m: req.query.m, y: req.query.y });
-    } catch (_) {
-      if (mode !== 'html') throw new Error('Parâmetros d/m/y obrigatórios (use ?d=DD&m=MM&y=YYYY)');
-    }
+    try { range = buildDateStrings({ d: req.query.d, m: req.query.m, y: req.query.y }); }
+    catch (_) { if (mode !== 'html') throw new Error('Parâmetros d/m/y obrigatórios (?d=DD&m=MM&y=YYYY)'); }
 
     const { WS, cookies } = readEnvs();
     const normCookies = normalizeCookies(cookies);
 
-    // Conecta no Browserless com retry + fallback
     browser = await connectWithRetryAndFallback(WS, 2);
-
-    // Contexto (em CDP geralmente já vem 1)
     context = browser.contexts()[0] || await browser.newContext({ ignoreHTTPSErrors: true });
-    if (normCookies.length) {
-      try { await context.addCookies(normCookies); } catch {}
-    }
+    if (normCookies.length) { try { await context.addCookies(normCookies); } catch {} }
 
     page = await context.newPage();
     page.setDefaultTimeout(25000);
@@ -139,19 +102,20 @@ module.exports = async function handler(req, res) {
     const targetUrl = 'https://app.upseller.com/pt/analytics/store-sales';
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Estabiliza SPA: load → título → presença de elementos-chave
     await page.waitForLoadState('load', { timeout: 20000 });
     await page.waitForFunction(
       () => document.readyState === 'complete' || document.title.toLowerCase().includes('upseller'),
       null, { timeout: 15000 }
     );
-    // guarda de estabilidade: espera o datepicker existir no DOM
+
+    // Guarda de estabilidade: espera existir algo "date-like" no DOM
     await page.waitForFunction(() => {
-      const hasPicker =
-        document.querySelector('.ant-picker-input input') ||
-        document.querySelector('.ant-picker') ||
-        document.querySelector('.ant-calendar-picker');
-      return hasPicker && document.readyState === 'complete';
+      const q = (sel) => document.querySelector(sel);
+      const has =
+        q('.ant-picker-input input') || q('.ant-picker-range') || q('.ant-picker') ||
+        q('.ant-calendar-picker') || q('input[placeholder*="Data"]') ||
+        q('[data-testid*="date"]') || q('[class*="date"]') || q('[class*="calendar"]');
+      return has && document.readyState === 'complete';
     }, null, { timeout: 15000 });
     await page.waitForTimeout(400);
 
@@ -166,55 +130,110 @@ module.exports = async function handler(req, res) {
       return json(res, 200, out);
     }
 
-    // ABRIR DATEPICKER com retry curto contra "execution context was destroyed"
-    const openerSelectors = [
-      '.ant-picker-input input',
-      '.ant-picker-range',
-      '.ant-picker',
-      '[data-testid="date-picker"]',
-      'input[placeholder*="Data"]',
-      "button[aria-label*='Data']",
+    // ► COLETA CANDIDATOS DE DATEPICKER (no DOM)
+    const candidates = await page.evaluate(() => {
+      const sels = [
+        '.ant-picker-input input', '.ant-picker-range', '.ant-picker',
+        '.ant-calendar-picker', '[data-testid*="date"]',
+        'input[placeholder*="Data"]', 'input[placeholder*="Período"]',
+        '[class*="date"]', '[class*="calendar"]',
+        'button', 'div[role="button"]', 'span[role="button"]'
+      ];
+      const uniq = new Set();
+      const results = [];
+      for (const sel of sels) {
+        document.querySelectorAll(sel).forEach(el => {
+          if (!el) return;
+          if (!(el.offsetWidth > 0 && el.offsetHeight > 0)) return;
+          const path = (el.className || el.tagName || '').toString().slice(0, 120);
+          if (uniq.has(el)) return;
+          uniq.add(el);
+          const rect = el.getBoundingClientRect();
+          results.push({
+            tag: el.tagName.toLowerCase(),
+            sel,
+            className: (el.className || '').toString(),
+            text: (el.textContent || '').trim().slice(0, 60),
+            rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
+          });
+        });
+      }
+      // ordena por "provável filtro no topo": y pequeno e largura razoável
+      results.sort((a, b) => (a.rect.y - b.rect.y) || (b.rect.w - a.rect.w));
+      return results.slice(0, 30);
+    });
+    diag.openerCandidates = candidates;
+
+    // ► TENTA ABRIR: estratégia 1 (click direto em candidatos mais prováveis)
+    const trySelectors = [
+      '.ant-picker-input input', '.ant-picker-range', '.ant-picker',
+      '.ant-calendar-picker', '[data-testid*="date"]',
+      'input[placeholder*="Data"]', 'input[placeholder*="Período"]',
+      '[class*="date"]', '[class*="calendar"]'
     ];
-
     let opened = false;
-    for (let attempt = 0; attempt < 2 && !opened; attempt++) {
-      try {
-        await page.waitForFunction(() => document.readyState === 'complete', null, { timeout: 5000 });
 
-        for (const sel of openerSelectors) {
-          const el = await page.$(sel);
-          if (el) {
-            await el.click();
-            opened = true;
-            break;
-          }
+    for (const sel of trySelectors) {
+      const el = await page.$(sel);
+      if (!el) continue;
+      try {
+        await el.click({ delay: 10 });
+        // verifica dropdown
+        const ddSel = await page.waitForSelector(
+          '.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container, [role="dialog"]',
+          { timeout: 1500 }
+        ).catch(() => null);
+        if (ddSel) {
+          opened = true;
+          diag.openerClicked = sel;
+          diag.dropdownDetected = true;
+          break;
         }
-        if (!opened) throw new Error('Datepicker não encontrado');
-      } catch (err) {
-        const msg = String(err && err.message || err);
-        if (msg.includes('Execution context was destroyed')) {
-          await page.waitForLoadState('load', { timeout: 8000 }).catch(() => {});
-          await page.waitForTimeout(600);
-          continue; // tenta de novo
-        }
-        throw err;
+      } catch {}
+    }
+
+    // ► Estratégia 2: click no centro do bounding box do melhor candidato
+    if (!opened && candidates.length) {
+      const best = candidates[0];
+      await page.evaluate((c) => {
+        const el = document.querySelector(c.sel);
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        const x = r.left + Math.min(r.width - 2, Math.max(8, r.width * 0.5));
+        const y = r.top + Math.min(r.height - 2, Math.max(8, r.height * 0.5));
+        window.scrollTo({ top: Math.max(0, r.top - 120) });
+        const target = document.elementFromPoint(x, y);
+        target?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        el.click?.();
+      }, best);
+
+      const ddSel = await page.waitForSelector(
+        '.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container, [role="dialog"]',
+        { timeout: 1500 }
+      ).catch(() => null);
+      if (ddSel) {
+        opened = true;
+        diag.openerClicked = `${best.sel} (bbox)`;
+        diag.dropdownDetected = true;
       }
     }
+
     if (!opened) throw new Error('Datepicker não encontrado');
 
-    // (Opcional) aqui você pode preencher a data; por ora retornamos a prova de vida:
+    // Sucesso até abrir o datepicker — paramos aqui por enquanto
     const took = Date.now() - started;
     return json(res, 200, {
       ok: true,
       reached: 'datepicker-opened',
       url: page.url(),
       title: await page.title().catch(() => null),
+      diag,
       tookMs: took
     });
 
   } catch (err) {
     const took = Date.now() - started;
-    return json(res, 200, { ok: false, error: String(err && err.message || err), tookMs: took });
+    return json(res, 200, { ok: false, error: String(err && err.message || err), diag, tookMs: took });
 
   } finally {
     try { if (page) await page.close(); } catch {}
