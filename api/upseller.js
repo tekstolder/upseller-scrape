@@ -1,217 +1,183 @@
-// api/upseller.js — Vercel (Node 20, ESM)
-// Requer as envs: BROWSERLESS_WS (wss://production-sfo.browserless.io/chromium?token=...)
-//                UPS_COOKIES_JSON (JSON array dos cookies, incluindo JSESSIONID e us_u)
+'use strict';
 
-import puppeteer from 'puppeteer-core';
+const { chromium } = require('playwright-core');
 
-const TARGET = 'https://app.upseller.com/pt/analytics/store-sales';
-
-function toDDMMYYYY({ d, m, y }) {
-  const dd = String(d).padStart(2, '0');
-  const mm = String(m).padStart(2, '0');
-  const yyyy = String(y);
-  return `${dd}/${mm}/${yyyy}`;
+/**
+ * Helper: devolve JSON padronizado
+ */
+function json(res, code, obj) {
+  res.status(code).setHeader('content-type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(obj));
 }
 
-function parseQuery(req) {
-  const u = new URL(req.url || `http://x.local${req.query ? '?' + new URLSearchParams(req.query) : ''}`);
-  const d = Number(u.searchParams.get('d'));
-  const m = Number(u.searchParams.get('m'));
-  const y = Number(u.searchParams.get('y'));
-  if (!d || !m || !y) throw new Error('Parâmetros inválidos: use ?d=DD&m=MM&y=YYYY');
-  return { d, m, y };
+/**
+ * Helper: parse de datas (DD/MM/YYYY) a partir de d,m,y
+ */
+function buildDateStrings({ d, m, y }) {
+  const dd = String(d || '').padStart(2, '0');
+  const mm = String(m || '').padStart(2, '0');
+  const yyyy = String(y || '');
+  if (dd.length !== 2 || mm.length !== 2 || yyyy.length !== 4) {
+    throw new Error('Parâmetros de data inválidos. Use ?d=DD&m=MM&y=YYYY');
+  }
+  const from = `${dd}/${mm}/${yyyy}`;
+  const to = `${dd}/${mm}/${yyyy}`;
+  return { from, to };
 }
 
-async function waitVisible(page, selectors, timeout = 8000) {
-  const tried = [];
-  for (const sel of selectors) {
-    try {
-      const el = await page.waitForSelector(sel, { visible: true, timeout });
-      if (el) return { el, sel };
-    } catch (e) {
-      tried.push(sel);
+/**
+ * Lê e valida envs
+ */
+function readEnvs() {
+  const WS = process.env.BROWSERLESS_WS || '';
+  const RAW = process.env.UPS_COOKIES_JSON || '';
+  if (!WS) throw new Error('BROWSERLESS_WS ausente');
+  if (!RAW) throw new Error('UPS_COOKIES_JSON ausente');
+
+  // Remover aspas involuntárias
+  const trimmed = RAW.trim().replace(/^"+|"+$/g, '');
+  let cookies;
+  try {
+    cookies = JSON.parse(trimmed);
+  } catch (e) {
+    throw new Error('UPS_COOKIES_JSON não é um JSON válido de array');
+  }
+  if (!Array.isArray(cookies)) {
+    throw new Error('UPS_COOKIES_JSON deve ser um array JSON de cookies');
+  }
+
+  return { WS, cookies };
+}
+
+/**
+ * Ajusta cookies para domínio app.upseller.com se faltar domain/path
+ */
+function normalizeCookies(cookies) {
+  return cookies.map((c) => ({
+    domain: c.domain || 'app.upseller.com',
+    path: c.path || '/',
+    httpOnly: !!c.httpOnly,
+    secure: c.secure !== false, // default true
+    sameSite: c.sameSite && typeof c.sameSite === 'string' ? c.sameSite : 'Lax',
+    name: c.name,
+    value: c.value
+  })).filter((c) => c && c.name && c.value);
+}
+
+module.exports = async function handler(req, res) {
+  const started = Date.now();
+
+  try {
+    // Modos de diagnóstico
+    const mode = (req.query.mode || '').toString().toLowerCase();
+    if (mode === 'ping') {
+      const { WS } = readEnvs(); // valida presença
+      return json(res, 200, { ok: true, ping: 'alive', hasWS: !!WS });
     }
-  }
-  const err = new Error('Nenhum seletor ficou visível');
-  err.meta = { tried };
-  throw err;
-}
 
-async function setInputValue(page, selector, value) {
-  // Tenta via teclado primeiro
-  try {
-    const handle = await page.$(selector);
-    if (!handle) throw new Error(`Input não encontrado: ${selector}`);
-    await handle.click({ clickCount: 3 });
-    await page.keyboard.type(value);
-    return 'typed';
-  } catch {
-    // Fallback: set value + dispatch events
-    await page.evaluate(
-      (sel, val) => {
-        const input = document.querySelector(sel);
-        if (!input) return 'no-input';
-        input.value = val;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        return 'setValue';
-      },
-      selector,
-      value
-    );
-    return 'setValue';
-  }
-}
+    // Datas (se faltar, não quebra — o modo html não precisa)
+    let range;
+    try {
+      range = buildDateStrings({ d: req.query.d, m: req.query.m, y: req.query.y });
+    } catch (_) {
+      // só reclama mais à frente se for realmente usar
+      range = null;
+    }
 
-export default async function handler(req, res) {
-  const t0 = Date.now();
-  let browser;
-  let context;
-  let page;
-  const diag = {
-    steps: [],
-    openerMatched: null,
-    fillStrategy: null,
-    urlAfter: null,
-    title: null,
-  };
+    const { WS, cookies } = readEnvs();
+    const normCookies = normalizeCookies(cookies);
 
-  try {
-    // 1) Params
-    const { d, m, y } = parseQuery(req);
-    const start = toDDMMYYYY({ d, m, y });
-    const end = start; // filtro de 1 dia
+    console.log('[upseller] connectOverCDP →', WS.slice(0, 40) + '...');
+    const browser = await chromium.connectOverCDP(WS);
 
-    // 2) Conecta no Browserless
-    const WS = process.env.BROWSERLESS_WS;
-    if (!WS) throw new Error('BROWSERLESS_WS ausente.');
-    browser = await puppeteer.connect({ browserWSEndpoint: WS });
+    // Em conexões CDP, normalmente já existe 1 contexto
+    let context = browser.contexts()[0];
+    if (!context) context = await browser.newContext({ ignoreHTTPSErrors: true });
 
-    context = await browser.createIncognitoBrowserContext();
+    if (normCookies.length) {
+      console.log('[upseller] addCookies:', normCookies.length);
+      try {
+        await context.addCookies(normCookies);
+      } catch (e) {
+        console.warn('[upseller] addCookies falhou (vai seguir mesmo assim):', e.message);
+      }
+    }
 
-    // 3) Injeta cookies
-    const raw = process.env.UPS_COOKIES_JSON;
-    if (!raw) throw new Error('UPS_COOKIES_JSON ausente.');
-    let cookies = JSON.parse(raw);
-    if (!Array.isArray(cookies)) cookies = [];
-    // Normaliza campos essenciais
-    cookies = cookies.map((c) => ({
-      ...c,
-      domain: c.domain || 'app.upseller.com',
-      path: c.path || '/',
-      secure: true,
-      sameSite: c.sameSite === 'unspecified' ? 'Lax' : c.sameSite || 'Lax',
-    }));
+    const page = await context.newPage();
+    page.setDefaultTimeout(25000);
 
-    page = await context.newPage();
-    await page.setDefaultTimeout(20000);
-    await context.addCookies(cookies);
+    const targetUrl = 'https://app.upseller.com/pt/analytics/store-sales';
+    console.log('[upseller] goto:', targetUrl);
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // 4) Abre a página e espera estabilizar
-    await page.goto(TARGET, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState?.('load').catch(() => {});
+    // Espera o título ficar estável / página pronta
+    await page.waitForLoadState('load', { timeout: 20000 });
     await page.waitForFunction(
       () => document.readyState === 'complete' || document.title.toLowerCase().includes('upseller'),
-      { timeout: 8000 }
+      null,
+      { timeout: 15000 }
     );
-    await page.waitForTimeout(800); // pequeno buffer
 
-    diag.title = await page.title();
-    diag.urlAfter = page.url();
-    diag.steps.push('Página carregada');
+    // Se modo=html → devolve HTML para inspecionarmos seletores do datepicker
+    if (mode === 'html') {
+      const html = await page.content();
+      await browser.close().catch(() => {});
+      return json(res, 200, {
+        ok: true,
+        diag: {
+          title: await page.title().catch(() => null),
+          url: page.url(),
+          len: html.length
+        },
+        html // cuidado: pode ser grande; use só pra diagnóstico
+      });
+    }
 
-    // 5) Localiza abertura do date-range
-    const openers = [
-      '.ant-picker',                            // Ant v4/v5 padrão
-      '.ant-calendar-picker',                   // legacy
-      '[class*="ant-picker"]:not([aria-hidden="true"])',
-      '[data-testid*="date"]',
-      'input[placeholder*="Data"]',
-      'input[placeholder*="Período"]',
-      'button:has(svg)',
+    // Daqui pra baixo é o fluxo normal: abrir o datepicker etc.
+    if (!range) throw new Error('Parâmetros d/m/y obrigatórios para o fluxo normal');
+
+    console.log('[upseller] procurando datepicker...');
+    const openerSelectors = [
+      '.ant-picker',
+      '.ant-calendar-picker',
+      "[class^='ant'][class*='picker'][class*='range']",
+      "[data-testid='date-picker']",
+      "input[placeholder*='Data']",
+      "button[aria-label*='Data']"
     ];
-    const { el: opener, sel: openerSel } = await waitVisible(page, openers, 8000);
-    diag.openerMatched = openerSel;
 
-    // Alguns layouts têm o input dentro do wrapper. Clique “inteligente”
-    await page.evaluate((node) => {
-      const r = node.getBoundingClientRect();
-      const x = r.left + r.width - 10;
-      const y = r.top + r.height / 2;
-      window.scrollTo({ top: r.top - 100 });
-      const e = document.elementFromPoint(x, y);
-      e?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    }, opener);
-    await page.waitForTimeout(150);
+    let opened = false;
+    for (const sel of openerSelectors) {
+      const el = await page.$(sel);
+      if (el) {
+        try {
+          await el.click({ timeout: 3000 });
+          opened = true;
+          console.log('[upseller] datepicker aberto via', sel);
+          break;
+        } catch (e) {
+          // tenta o próximo
+        }
+      }
+    }
+    if (!opened) throw new Error('Datepicker não encontrado');
 
-    // Confirma se o painel abriu
-    const dropdownSelectors = ['.ant-picker-dropdown', '.ant-picker-panel', '.ant-calendar-picker-container'];
-    await waitVisible(page, dropdownSelectors, 4000).catch(async () => {
-      // caso não abra com o click “inteligente”, clica direto no opener
-      await page.click(openerSel, { delay: 30 }).catch(() => {});
-      await waitVisible(page, dropdownSelectors, 4000);
-    });
-    diag.steps.push('Datepicker aberto');
+    // 👉 aqui entram as ações de preenchimento da data (a depender do widget real)
+    // Por ora, só retornamos o diagnóstico para validar que chegamos até aqui.
 
-    // 6) Preenche os 2 inputs do range
-    // Na maioria dos Ant pickers os inputs ficam assim:
-    // .ant-picker-input input (primeiro = início; segundo = fim)
-    const startInputSel = '.ant-picker-dropdown .ant-picker-input input, .ant-picker-panel .ant-picker-input input';
-    const endInputSel =
-      '.ant-picker-dropdown .ant-picker-input input:nth-of-type(2), .ant-picker-panel .ant-picker-input input:nth-of-type(2)';
-
-    // Fallback final: se não encontrar “nth-of-type(2)”, procura o segundo manualmente
-    const inputsCount = await page.$$eval(startInputSel, (els) => els.length).catch(() => 0);
-    if (!inputsCount) throw new Error('Inputs do date-range não encontrados');
-
-    // Preenche início
-    const stratA = await setInputValue(page, startInputSel, start);
-
-    // Preenche fim (se só tiver 1 input — alguns layouts usam um só — repete no mesmo)
-    let endSelectorToUse = endInputSel;
-    const endExists = await page.$(endInputSel);
-    if (!endExists) endSelectorToUse = startInputSel;
-    const stratB = await setInputValue(page, endSelectorToUse, end);
-
-    diag.fillStrategy = { start: stratA, end: stratB };
-
-    // Pressiona Enter para fechar e aplicar
-    await page.keyboard.press('Enter').catch(() => {});
-    await page.waitForTimeout(500);
-
-    // 7) Aguarda efeito do filtro (alguma mudança na tela)
-    await page.waitForFunction(
-      () => !!document.querySelector('.ant-table') || !!document.querySelector('[class*="chart"]'),
-      { timeout: 8000 }
-    ).catch(() => {}); // alguns dashboards podem não ter tabela/chart explícitos
-
-    diag.title = await page.title();
-    diag.urlAfter = page.url();
-    diag.steps.push('Filtro aplicado');
-
-    // 8) (Opcional) Leia um KPI simples como prova de vida
-    const kpiText =
-      (await page.$eval('.ant-statistic-content, .ant-card-meta-title, .kpi, [data-testid*="kpi"]', (el) => el.textContent.trim()).catch(() => null)) ||
-      null;
-
-    const tookMs = Date.now() - t0;
-    res.status(200).json({
+    const took = Date.now() - started;
+    await browser.close().catch(() => {});
+    return json(res, 200, {
       ok: true,
-      tookMs,
-      diag,
-      sample: { kpiText },
+      reached: 'datepicker-opened',
+      url: targetUrl,
+      title: await page.title().catch(() => null),
+      tookMs: took
     });
+
   } catch (err) {
-    const tookMs = Date.now() - t0;
-    res.status(200).json({
-      ok: false,
-      error: String(err && err.message ? err.message : err),
-      tookMs,
-      diag,
-    });
-  } finally {
-    try { if (page) await page.close(); } catch {}
-    try { if (context) await context.close(); } catch {}
-    try { if (browser) await browser.disconnect(); } catch {}
+    console.error('[upseller] ERROR:', err && err.stack || err);
+    const took = Date.now() - started;
+    return json(res, 500, { ok: false, error: String(err && err.message || err), tookMs: took });
   }
-}
+};
