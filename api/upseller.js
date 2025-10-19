@@ -54,7 +54,16 @@ module.exports = async function handler(req, res) {
 
     const target = 'https://app.upseller.com/pt/analytics/store-sales';
     await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(1200); // evita networkidle (SPA)
+
+    // Aguarda redirect pós-login (até 8 segundos) e o título da página correta
+    await page.waitForLoadState('load', { timeout: 8000 });
+    await page.waitForFunction(
+    () => document.title.includes('UpSeller') || document.readyState === 'complete',
+    { timeout: 8000 }
+    );
+
+    // pequeno delay adicional para renderização do painel
+    await page.waitForTimeout(1200);
 
     // 1) Abre o datepicker (suporta antigos e novos seletores)
     const openerSelectors = [
