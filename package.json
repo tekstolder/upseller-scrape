@@ -1,7 +1,6 @@
 {
   "name": "upseller-scrape",
   "version": "1.0.0",
-  "type": "module",
   "dependencies": {
     "playwright-core": "^1.47.0"
   }
