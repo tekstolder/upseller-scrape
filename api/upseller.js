@@ -1,277 +1,322 @@
 // api/upseller.js
+// Node.js (CommonJS) – Vercel serverless
 const { chromium } = require('playwright-core');
 
-/** Utilidades -------------------------------------------------------------- */
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const json = (res, status, data) => {
-  res.statusCode = status;
-  res.setHeader('content-type', 'application/json; charset=utf-8');
-  res.end(JSON.stringify(data, null, 2));
-};
-const getWs = () => {
-  let ws = process.env.BROWSERLESS_WS || '';
-  // aceita wss://production-xxx.browserless.io e wss://.../chromium
-  if (ws && !/\/chromium($|\?)/.test(ws)) {
-    // se já vier com query (?token=...), mantemos
-    const [base, q] = ws.split('?');
-    ws = `${base.replace(/\/+$/, '')}/chromium${q ? `?${q}` : ''}`;
-  }
-  return ws;
-};
+// ----------------- helpers -----------------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// pt-BR: "3.683,65" -> 3683.65
-function brToNumber(txt) {
-  if (txt == null) return 0;
-  const s = String(txt).replace(/\./g, '').replace(',', '.').replace(/[^\d.-]/g, '');
-  const n = Number(s);
+function json(res, status, body) {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.status(status).send(JSON.stringify(body, null, 2));
+}
+
+const deaccent = (s) =>
+  (s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+
+function brDate(d, m, y) {
+  // d, m, y strings ("01","01","2025")
+  return `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${String(y).padStart(4, '0')}`;
+}
+
+function parseMoneyBR(txt) {
+  // "1.234,56" -> 1234.56
+  if (!txt) return 0;
+  const only = String(txt).replace(/\s/g, '').replace(/[R$\u00A0]/g, '');
+  const norm = only.replace(/\./g, '').replace(/,/g, '.');
+  const num = Number(norm);
+  return Number.isFinite(num) ? num : 0;
+}
+
+function parseIntSafe(txt) {
+  const n = Number(String(txt).replace(/[^\d\-]/g, ''));
   return Number.isFinite(n) ? n : 0;
 }
 
-/** Seleciona o range de datas (dois inputs) -------------------------------- */
-async function setDateRange(page, fromBr, toBr) {
-  // abre o datepicker (tenta seletores antigos e novos)
-  const openerSelectors = [
-    '.ant-picker',
-    '.ant-calendar-picker',
-    '.ant-picker-range'
-  ];
+// -------------- playwright connect --------------
+async function connect() {
+  const ws = process.env.BROWSERLESS_WS;
+  if (!ws) throw new Error('BROWSERLESS_WS não configurado');
+  const browser = await chromium.connectOverCDP(ws, { timeout: 30000 });
+  const [context] = browser.contexts().length
+    ? browser.contexts()
+    : [await browser.newContext({ userAgent: undefined })];
+  return { browser, context };
+}
 
+// -------------- cookies -----------------
+async function applyCookies(context) {
+  const raw = process.env.UPS_COOKIES_JSON;
+  if (!raw) return;
+
+  let cookies = [];
+  try {
+    cookies = JSON.parse(raw);
+  } catch {
+    // pode estar em string (Share Cookie) -> tenta converter
+    if (raw.trim().startsWith('[')) throw new Error('UPS_COOKIES_JSON inválido (JSON malformado).');
+  }
+  // transforma no formato playwright
+  const pwCookies = cookies
+    .map((c) => {
+      const isApp = (c.domain || '').includes('upseller.com');
+      const domain = c.domain || (isApp ? 'app.upseller.com' : undefined);
+      return {
+        name: c.name,
+        value: c.value,
+        domain,
+        path: c.path || '/',
+        httpOnly: !!c.httpOnly,
+        secure: typeof c.secure === 'boolean' ? c.secure : true,
+        sameSite: c.sameSite === 'lax' || c.sameSite === 'Lax' ? 'Lax'
+          : c.sameSite === 'strict' || c.sameSite === 'Strict' ? 'Strict'
+          : 'None',
+        expires: c.expirationDate ? Math.floor(Number(c.expirationDate)) : undefined
+      };
+    })
+    .filter((c) => !!c.name && !!c.value);
+
+  if (pwCookies.length) {
+    await context.addCookies(pwCookies);
+  }
+}
+
+// ---------------- waits robustos ----------------
+async function waitForTableReady(page) {
+  // espera a tabela aparecer
+  await page.waitForSelector('.ant-table', { timeout: 20000 }).catch(() => {});
+  // espera spinner sumir e linhas estabilizarem
+  let last = null, stable = 0;
+  for (let i = 0; i < 40; i++) {
+    const state = await page.evaluate(() => {
+      const spinning = !!document.querySelector('.ant-spin-spinning');
+      const tbody = document.querySelector('.ant-table tbody');
+      const rows = tbody ? tbody.querySelectorAll('tr').length : 0;
+      return { spinning, rows };
+    }).catch(() => ({ spinning: false, rows: 0 }));
+
+    if (last && last.spinning === state.spinning && last.rows === state.rows) stable++;
+    else stable = 0;
+
+    last = state;
+    if (!state.spinning && state.rows > 0 && stable >= 2) return true;
+    await sleep(350);
+  }
+  return false;
+}
+
+async function setDateRange(page, fromBr, toBr) {
+  // garante que temos DOM
+  await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+  await sleep(300);
+
+  // tenta abrir o datepicker
+  const openerSelectors = ['.ant-picker', '.ant-calendar-picker', '.ant-picker-range'];
   let opened = false;
   for (const sel of openerSelectors) {
-    const el = await page.$(sel);
-    if (el) {
-      await el.click({ delay: 10 });
+    const handle = await page.$(sel).catch(() => null);
+    if (handle) {
+      await handle.click({ delay: 20 }).catch(() => {});
       opened = true;
       break;
     }
   }
   if (!opened) throw new Error('Datepicker não encontrado');
 
-  // garante que os inputs renderizaram
-  // novos: .ant-picker-input input
-  // antigos: .ant-calendar-range-picker-input
-  let inputs = await page.$$('.ant-picker-input input');
+  // encontra inputs do range
+  let inputs = await page.$$('.ant-picker-input input').catch(() => []);
   if (!inputs || inputs.length < 2) {
-    inputs = await page.$$('.ant-calendar-range-picker-input');
+    inputs = await page.$$('.ant-calendar-range-picker-input').catch(() => []);
   }
   if (!inputs || inputs.length < 2) {
     throw new Error('Inputs do date-range não encontrados');
   }
 
-  // preenche os dois inputs (Ctrl/Meta + A) e Enter para aplicar
+  // preenche os 2 campos
   for (let i = 0; i < 2; i++) {
-    await inputs[i].click({ clickCount: 3 });
-    await page.keyboard.press('ControlOrMeta+A');
-    await page.keyboard.type(i === 0 ? fromBr : toBr, { delay: 20 });
+    await inputs[i].click({ clickCount: 3 }).catch(() => {});
+    await page.keyboard.press('ControlOrMeta+A').catch(() => {});
+    await page.keyboard.type(i === 0 ? fromBr : toBr, { delay: 18 }).catch(() => {});
   }
-  await page.keyboard.press('Enter');
+  await page.keyboard.press('Enter').catch(() => {});
 
-  // aguarda a tabela recarregar / DOM estabilizar
-  await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
-  // pequena folga para requests internas
-  await sleep(1200);
+  // espera rede/DOM assentarem
+  await Promise.race([
+    page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {}),
+    sleep(1500)
+  ]);
+  // e depois esperamos a tabela estabilizar
+  await waitForTableReady(page);
 }
 
-/** Lê a tabela visível, mapeando cabeçalhos por texto ---------------------- */
+// ---------------- tabela + agrupamento ----------------
 async function parseSalesTable(page) {
-  return await page.evaluate(() => {
-    const norm = (s) =>
-      (s || '')
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .toLowerCase();
-
+  // captura cabeçalhos e até 500 linhas (performance boa e sobra)
+  const data = await page.evaluate(() => {
+    function txt(el) { return (el && (el.textContent || '') || '').trim(); }
     const table = document.querySelector('.ant-table');
-    if (!table) return { headers: [], rows: [] };
+    if (!table) return null;
 
-    const headers = Array.from(table.querySelectorAll('thead th')).map((th) =>
+    const headers = Array.from(table.querySelectorAll('thead th')).map(th =>
       (th.textContent || '').trim()
     );
 
-    const headerIndex = {};
-    headers.forEach((h, idx) => {
-      const n = norm(h);
-      if (n.includes('loja')) headerIndex.loja = idx;
-      if (n.includes('pedidos válidos') || n.includes('pedidos validos')) headerIndex.pedidosValidos = idx;
-      if (n.includes('valor de vendas válidas') || n.includes('valor de vendas validas')) headerIndex.valorVendasValidas = idx;
-      if (headerIndex.loja == null && n === 'loja') headerIndex.loja = idx;
-    });
+    const rows = Array.from(table.querySelectorAll('tbody tr')).slice(0, 500).map(tr =>
+      Array.from(tr.querySelectorAll('td')).map(td => (td.textContent || '').trim())
+    );
 
-    const rows = Array.from(table.querySelectorAll('tbody tr'))
-      .map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim()))
-      .filter((r) => r.length);
-
-    return { headers, rows, headerIndex };
+    return { headers, rows };
   });
+
+  if (!data || !data.headers || !data.rows) {
+    return { headers: [], rows: [] };
+  }
+  return data;
 }
 
-/** Agrupa por prefixo (MELI / SPEE), soma e ordena ------------------------- */
-function groupAndTop(data) {
-  // mapeia linhas cruas em objetos fortes
-  const mapped = data.rows.map((cols) => {
-    const loja = cols[data.headerIndex.loja] || '';
-    const pedidosValidosTxt = data.headerIndex.pedidosValidos != null ? cols[data.headerIndex.pedidosValidos] : '0';
-    const valorVendasTxt   = data.headerIndex.valorVendasValidas != null ? cols[data.headerIndex.valorVendasValidas] : '0';
-
-    return {
-      loja,
-      pedidosValidos: Number(String(pedidosValidosTxt).replace(/[^\d]/g, '')) || 0,
-      valorVendasValidas: brToNumber(valorVendasTxt)
-    };
-  });
-
-  // separa por prefixo
-  const meli = mapped.filter((r) => /^MELI\b/i.test(r.loja));
-  const spee = mapped.filter((r) => /^SPEE\b/i.test(r.loja));
-
-  // ordena por valor desc
-  const sortDesc = (a, b) => b.valorVendasValidas - a.valorVendasValidas;
-
-  // pega top 7 de cada
-  const topMeli = meli.sort(sortDesc).slice(0, 7);
-  const topSpee = spee.sort(sortDesc).slice(0, 7);
-
-  // só retorna colunas pedidas
-  const pick = (r) => ({
-    loja: r.loja,
-    pedidosValidos: r.pedidosValidos,
-    valorVendasValidas: r.valorVendasValidas
-  });
-
-  return {
-    meli: topMeli.map(pick),
-    spee: topSpee.map(pick)
+function locateColumns(headers) {
+  // normaliza e localiza por aproximação
+  const norm = headers.map(h => deaccent(h).toLowerCase());
+  const idx = {
+    loja: -1,
+    pedidosValidos: -1,
+    valorVendasValidas: -1
   };
+
+  for (let i = 0; i < norm.length; i++) {
+    const h = norm[i];
+    if (idx.loja < 0 && /^(loja|store)/.test(h)) idx.loja = i;
+    if (idx.pedidosValidos < 0 && (h.includes('pedidos valid') || h.includes('pedidosvalid'))) idx.pedidosValidos = i;
+    if (idx.valorVendasValidas < 0 && (h.includes('valor de vendas valid') || h.includes('valor devendas valid'))) idx.valorVendasValidas = i;
+  }
+  return idx;
 }
 
-/** Handler principal -------------------------------------------------------- */
+function groupAndTop(rows, idx) {
+  const items = [];
+  for (const r of rows) {
+    const loja = r[idx.loja] || '';
+    const prefix = (loja || '').trim().toUpperCase();
+    const pv = parseIntSafe(r[idx.pedidosValidos]);
+    const vv = parseMoneyBR(r[idx.valorVendasValidas]);
+    if (!loja) continue;
+
+    items.push({ loja, pedidosValidos: pv, valorVendasValidas: vv });
+  }
+
+  const meli = items
+    .filter(it => it.loja.trim().toUpperCase().startsWith('MELI'))
+    .sort((a, b) => b.valorVendasValidas - a.valorVendasValidas)
+    .slice(0, 7);
+
+  const spee = items
+    .filter(it => it.loja.trim().toUpperCase().startsWith('SPEE'))
+    .sort((a, b) => b.valorVendasValidas - a.valorVendasValidas)
+    .slice(0, 7);
+
+  return { meli, spee, totalRows: items.length };
+}
+
+// ---------------- handler ----------------
 module.exports = async (req, res) => {
-  const started = Date.now();
+  const t0 = Date.now();
+  const { d, m, y, mode } = req.query || {};
+  const target = 'https://app.upseller.com/pt/analytics/store-sales';
 
-  // querystring: ?d=DD&m=MM&y=YYYY&mode=...
-  const { d, m, y, mode } = Object.fromEntries(new URL(req.url, 'http://x').searchParams);
-  const from = `${d || '01'}/${m || '01'}/${y || '2025'}`;
-  const to   = `${d || '01'}/${m || '01'}/${y || '2025'}`;
-
-  // diagnósticos rápidos
+  // modos de diagnóstico
   if (mode === 'ping') {
-    const ws = getWs();
-    return json(res, 200, { ok: !!ws, ping: 'alive', hasWS: !!ws });
-  }
-
-  const wsEndpoint = getWs();
-  if (!wsEndpoint) {
-    return json(res, 500, { ok: false, error: 'BROWSERLESS_WS não configurado' });
-  }
-
-  const targetUrl = 'https://app.upseller.com/pt/analytics/store-sales';
-
-  let browser;
-  let context;
-  let page;
-
-  try {
-    browser = await chromium.connectOverCDP(wsEndpoint);
-    // CDP do Chromium geralmente cria 1 contexto persistente
-    context = browser.contexts()[0] || (await browser.newContext?.());
-
-    // injeta cookies (se houver) para já entrar logado
-    const cookiesJson = process.env.UPS_COOKIES_JSON;
-    if (cookiesJson) {
-      try {
-        const raw = JSON.parse(cookiesJson);
-        const cookies = Array.isArray(raw)
-          ? raw
-          : Array.isArray(raw.cookies)
-          ? raw.cookies
-          : [];
-        if (cookies.length) await context.addCookies(cookies);
-      } catch {
-        // se quebrar o JSON, apenas ignora para não interromper
-      }
+    try {
+      const { browser, context } = await connect();
+      await browser.close().catch(() => {});
+      return json(res, 200, { ok: true, ping: 'alive', hasWS: true });
+    } catch (err) {
+      return json(res, 200, { ok: false, ping: 'fail', error: String(err && err.message || err) });
     }
+  }
+
+  if (mode === 'html') {
+    try {
+      const { browser, context } = await connect();
+      await applyCookies(context);
+      const page = await context.newPage();
+      await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      const html = await page.evaluate(() => document.documentElement.outerHTML);
+      const diag = {
+        title: await page.title().catch(() => null),
+        url: page.url(),
+        len: (html || '').length
+      };
+      await browser.close().catch(() => {});
+      return json(res, 200, { ok: true, diag, html });
+    } catch (err) {
+      return json(res, 200, { ok: false, error: String(err && err.message || err) });
+    }
+  }
+
+  // fluxo normal
+  const from = brDate(d || '01', m || '01', y || '2025');
+  const to = from; // conforme seu pedido: mesma data nos dois campos
+
+  let browser, context, page;
+  try {
+    ({ browser, context } = await connect());
+    await applyCookies(context);
 
     page = await context.newPage();
+    page.setDefaultTimeout(20000);
 
-    // carrega a página
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    // aguarda título ou DOM “quieto”
+    await Promise.race([
+      page.waitForFunction(() => /UpSeller/i.test(document.title) || document.readyState === 'complete', { timeout: 8000 }),
+      sleep(1200)
+    ]).catch(() => {});
 
-    // diagnóstico de HTML bruto
-    if (mode === 'html') {
-      const html = await page.content();
-      return json(res, 200, {
-        ok: true,
-        diag: {
-          title: await page.title().catch(() => null),
-          url: page.url(),
-          len: html.length
-        },
-        html
-      });
-    }
-
-    // garante título correto e DOM pronto
-    await page.waitForFunction(
-      () =>
-        document.readyState === 'complete' ||
-        (document.title || '').toLowerCase().includes('upseller'),
-      { timeout: 20000 }
-    ).catch(() => {});
-    await sleep(500);
-
-    // aplica período
+    // aplica período e espera a tabela
     await setDateRange(page, from, to);
 
-    // carrega tabela e mapeia colunas
+    // coleta tabela
     const table = await parseSalesTable(page);
-
-    if (
-      !table ||
-      !table.rows ||
-      !table.rows.length ||
-      table.headerIndex.loja == null ||
-      table.headerIndex.pedidosValidos == null ||
-      table.headerIndex.valorVendasValidas == null
-    ) {
-      return json(res, 200, {
-        ok: true,
-        page: { title: await page.title().catch(() => null), url: page.url() },
-        info: 'Tabela não encontrada ou cabeçalhos ausentes',
-        diag: { headers: table?.headers || [], headerIndex: table?.headerIndex || {} },
-        tookMs: Date.now() - started
-      });
+    const idx = locateColumns(table.headers || []);
+    if (idx.loja < 0 || idx.pedidosValidos < 0 || idx.valorVendasValidas < 0) {
+      throw new Error('Não consegui localizar colunas (Loja / Pedidos Válidos / Valor de Vendas Válidas).');
     }
+    const grouped = groupAndTop(table.rows || [], idx);
 
-    // agrupa e ordena
-    const grupos = groupAndTop(table);
-
-    return json(res, 200, {
+    const out = {
       ok: true,
       period: { from, to },
       page: { title: await page.title().catch(() => null), url: page.url() },
-      result: {
-        meli: grupos.meli, // top 7 MELI
-        spee: grupos.spee  // top 7 SPEE
+      groups: {
+        meli: grouped.meli,
+        spee: grouped.spee
       },
-      diag: {
+      totals: {
+        meli: {
+          pedidosValidos: grouped.meli.reduce((s, r) => s + r.pedidosValidos, 0),
+          valorVendasValidas: grouped.meli.reduce((s, r) => s + r.valorVendasValidas, 0)
+        },
+        spee: {
+          pedidosValidos: grouped.spee.reduce((s, r) => s + r.pedidosValidos, 0),
+          valorVendasValidas: grouped.spee.reduce((s, r) => s + r.valorVendasValidas, 0)
+        }
+      },
+      tableSample: {
         headers: table.headers,
-        headerIndex: table.headerIndex,
-        totalRows: table.rows.length
+        sampleRows: (table.rows || []).slice(0, 5)
       },
-      tookMs: Date.now() - started
-    });
+      tookMs: Date.now() - t0
+    };
+
+    await browser.close().catch(() => {});
+    return json(res, 200, out);
   } catch (err) {
-    return json(res, 200, {
-      ok: false,
-      error: String(err && err.message || err),
-      tookMs: Date.now() - started
-    });
-  } finally {
-    // fecha página/contexto (o Browserless encerra a sessão em seguida)
-    try { if (page) await page.close(); } catch {}
-    try { if (context && context !== browser.contexts?.[0]) await context.close(); } catch {}
-    try { if (browser) await browser.close(); } catch {}
+    const took = Date.now() - t0;
+    // fecha browser se abriu
+    if (browser) await browser.close().catch(() => {});
+    return json(res, 200, { ok: false, error: String(err && err.message || err), tookMs: took });
   }
 };
