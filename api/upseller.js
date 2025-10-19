@@ -16,7 +16,7 @@ function buildDateStrings({ d, m, y }) {
   if (dd.length !== 2 || mm.length !== 2 || yyyy.length !== 4) {
     throw new Error('Parâmetros de data inválidos. Use ?d=DD&m=MM&y=YYYY');
   }
-  return { from: `${dd}/${mm}/${yyyy}`, to: `${dd}/${mm}/${yyyy}` };
+  return { from: `${dd}/${mm}/${yyyy}`, to: `${dd}/${mm}/${yyyy}`, dd, mm, yyyy };
 }
 
 function readEnvs() {
@@ -72,12 +72,140 @@ async function connectWithRetryAndFallback(primaryWs, triesPerRegion = 2) {
   throw lastErr;
 }
 
+/* ------------------ Calendar helpers (Ant Design) ------------------ */
+async function waitDropdown(page) {
+  const dd = await page.waitForSelector(
+    '.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container, [role="dialog"]',
+    { timeout: 4000 }
+  ).catch(() => null);
+  if (!dd) throw new Error('Dropdown do calendário não abriu');
+}
+
+async function ensureMonthYear(page, y, m) {
+  // Tenta detectar mês/ano atuais em ambos os painéis (esquerdo/direito)
+  // e usa header prev/next até chegar no alvo.
+  const alvo = { y: Number(y), m: Number(m) }; // 1..12
+  const maxSteps = 24; // limite de iterações
+
+  function monthIndexPT(txt) {
+    const t = (txt || '').toLowerCase();
+    const nomes = ['janeiro','fevereiro','mar','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'];
+    for (let i = 0; i < nomes.length; i++) {
+      if (t.includes(nomes[i])) {
+        // 'mar' cobre 'março'
+        if (nomes[i] === 'mar' && !t.includes('mar')) continue;
+        return i % 12; // 0..11
+      }
+    }
+    return -1;
+  }
+
+  for (let step = 0; step < maxSteps; step++) {
+    const pos = await page.evaluate(() => {
+      function readPanel(root) {
+        if (!root) return null;
+        const mBtn = root.querySelector('.ant-picker-month-btn, .ant-calendar-month-select');
+        const yBtn = root.querySelector('.ant-picker-year-btn, .ant-calendar-year-select');
+        const mt = (mBtn?.textContent || '').trim();
+        const yt = (yBtn?.textContent || '').trim();
+        return { mt, yt };
+      }
+      const dd = document.querySelector('.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container') || document;
+      const panels = Array.from(dd.querySelectorAll('.ant-picker-panel'));
+      const legacyLeft  = dd.querySelector('.ant-calendar-range-left');
+      const legacyRight = dd.querySelector('.ant-calendar-range-right');
+      const L = panels[0] || legacyLeft;
+      const R = panels[1] || legacyRight;
+      return { left: readPanel(L), right: readPanel(R) };
+    });
+
+    const candidates = [pos.left, pos.right].filter(Boolean);
+    let found = false;
+    for (const p of candidates) {
+      const mi = monthIndexPT(p.mt);
+      const yy = parseInt(p.yt, 10);
+      if (mi >= 0 && yy) {
+        const cur = { y: yy, m: mi + 1 };
+        if (cur.y === alvo.y && cur.m === alvo.m) {
+          found = true; break;
+        }
+      }
+    }
+    if (found) return;
+
+    // decide ir para trás ou frente: se ano/mes alvo é anterior ao atual (primeiro painel)
+    const goPrev = await page.evaluate(({ monthIndexPTStr, alvo }) => {
+      function monthIndexPT(txt) {
+        const t = (txt || '').toLowerCase();
+        const nomes = ['janeiro','fevereiro','mar','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'];
+        for (let i = 0; i < nomes.length; i++) {
+          if (t.includes(nomes[i])) return i % 12;
+        }
+        return -1;
+      }
+      const dd = document.querySelector('.ant-picker-dropdown, .ant-picker-panel, .ant-calendar-picker-container') || document;
+      const panel = dd.querySelector('.ant-picker-panel') || dd;
+      const mBtn = panel.querySelector('.ant-picker-month-btn, .ant-calendar-month-select');
+      const yBtn = panel.querySelector('.ant-picker-year-btn, .ant-calendar-year-select');
+      const mi = monthIndexPT(mBtn?.textContent || '');
+      const yy = parseInt(yBtn?.textContent || '0', 10);
+      if (!yy || mi < 0) return false;
+      // comparar curr (yy, mi+1) com alvo (y, m)
+      if (yy > alvo.y) return true;
+      if (yy < alvo.y) return false;
+      // mesmo ano
+      return (mi + 1) > alvo.m;
+    }, { monthIndexPTStr: monthIndexPT.toString(), alvo });
+
+    const btnSel = goPrev
+      ? '.ant-picker-header-prev-btn, .ant-calendar-prev-month-btn'
+      : '.ant-picker-header-next-btn, .ant-calendar-next-month-btn';
+    const btn = await page.$(btnSel);
+    if (btn) await btn.click({ delay: 10 });
+    await page.waitForTimeout(200);
+  }
+
+  throw new Error('Não foi possível posicionar mês/ano no calendário');
+}
+
+async function clickDayTwice(page, d) {
+  // Seleciona o dia no(s) painel(is) visíveis (novo e legado)
+  const dia = String(parseInt(d, 10));
+  // tenta no painel novo
+  const selNew = `.ant-picker-cell-in-view .ant-picker-cell-inner:text-is("${dia}")`;
+  const elNew = await page.$(selNew).catch(() => null);
+  if (elNew) {
+    await elNew.click();
+    await page.waitForTimeout(250);
+    await elNew.click();
+    return 'new';
+  }
+  // tenta no legado
+  const selOld = `.ant-calendar-date:text-is("${dia}")`;
+  const elOld = await page.$(selOld).catch(() => null);
+  if (elOld) {
+    await elOld.click();
+    await page.waitForTimeout(250);
+    await elOld.click();
+    return 'old';
+  }
+  // fallback: procura por células de dia e compara texto
+  const ok = await page.evaluate((dia) => {
+    const cells = Array.from(document.querySelectorAll('.ant-picker-cell-inner, .ant-calendar-date'));
+    const alvo = cells.find(el => (el.textContent || '').trim() === dia);
+    if (!alvo) return false;
+    alvo.click(); setTimeout(() => alvo.click(), 250);
+    return true;
+  }, dia);
+  if (ok) return 'fallback';
+  throw new Error(`Dia ${dia} não encontrado no calendário`);
+}
+
 /* -------------------------- Core -------------------------- */
 module.exports = async function handler(req, res) {
   const started = Date.now();
   let browser, context, page;
 
-  // modos de diagnóstico
   const mode = (req.query.mode || '').toString().toLowerCase();
   if (mode === 'ping') {
     try {
@@ -118,18 +246,17 @@ module.exports = async function handler(req, res) {
       return json(res, 200, out);
     }
 
-    // --- guarda de estabilidade: presença de algo "date-like" no DOM ---
+    // -------- abrir o datepicker --------
     await page.waitForFunction(() => {
       const q = (sel) => document.querySelector(sel);
       const has =
-        q('.ant-picker-input input') || q('.ant-picker-range') || q('.ant-picker') ||
-        q('.ant-calendar-picker') || q('input[placeholder*="Data"]') ||
-        q('[data-testid*="date"]') || q('[class*="date"]') || q('[class*="calendar"]');
+        q('.ant-picker') || q('.ant-calendar-picker') || q('.ant-picker-range') ||
+        q('.ant-picker-input input') || q('[data-testid*="date"]') ||
+        q('input[placeholder*="Data"]') || q('[class*="date"]') || q('[class*="calendar"]');
       return has && document.readyState === 'complete';
     }, null, { timeout: 15000 });
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(200);
 
-    // --- abrir datepicker (duas tentativas, lida com SPA re-render) ---
     const openerSelectors = [
       '.ant-calendar-picker',
       '.ant-picker-input input',
@@ -142,7 +269,6 @@ module.exports = async function handler(req, res) {
     let opened = false;
     for (let attempt = 0; attempt < 2 && !opened; attempt++) {
       try {
-        await page.waitForFunction(() => document.readyState === 'complete', null, { timeout: 5000 });
         for (const sel of openerSelectors) {
           const el = await page.$(sel);
           if (!el) continue;
@@ -157,7 +283,7 @@ module.exports = async function handler(req, res) {
       } catch (err) {
         if (String(err).includes('Execution context was destroyed')) {
           await page.waitForLoadState('load', { timeout: 8000 }).catch(() => {});
-          await page.waitForTimeout(600);
+          await page.waitForTimeout(500);
           continue;
         }
         throw err;
@@ -165,44 +291,27 @@ module.exports = async function handler(req, res) {
     }
     if (!opened) return json(res, 200, { ok: false, error: 'Datepicker não encontrado' });
 
-    // --- preencher os DOIS inputs (início e fim) dentro do dropdown ---
-    // localiza os inputs na dropdown/painel de calendário
+    // -------- se não há inputs, navega mês/ano e clica dia duas vezes --------
     let inputs = await page.$$('.ant-picker-dropdown .ant-picker-input input');
-    if (inputs.length < 2) {
-      inputs = await page.$$('.ant-picker-panel .ant-picker-input input');
-    }
-    if (inputs.length < 2) {
-      // fallback ultra genérico: pega inputs visíveis na dropdown
-      inputs = await page.$$('.ant-picker-dropdown input, .ant-picker-panel input');
-    }
-    if (!inputs.length) {
-      return json(res, 200, { ok: false, error: 'Inputs do date-range não encontrados' });
-    }
-
-    // define start (índice 0) e end (índice 1 ou o mesmo se não houver dois)
-    const startInput = inputs[0];
-    const endInput = inputs[1] || inputs[0];
-
-    async function typeOrSet(el, value) {
-      try {
-        await el.click({ clickCount: 3 });
-        await page.keyboard.type(value);
-        return 'typed';
-      } catch {
-        await page.evaluate((e, v) => {
-          e.value = v;
-          e.dispatchEvent(new Event('input', { bubbles: true }));
-          e.dispatchEvent(new Event('change', { bubbles: true }));
-        }, el, value);
-        return 'setValue';
+    if (inputs.length < 2) inputs = await page.$$('.ant-picker-panel .ant-picker-input input');
+    if (inputs.length >= 2) {
+      // há inputs: preenche normalmente
+      const startInput = inputs[0];
+      const endInput = inputs[1] || inputs[0];
+      async function typeOrSet(el, value) {
+        try { await el.click({ clickCount: 3 }); await page.keyboard.type(value); return 'typed'; }
+        catch { await page.evaluate((e, v) => { e.value = v; e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); }, el, value); return 'setValue'; }
       }
+      await typeOrSet(startInput, range.from);
+      await page.waitForTimeout(120);
+      await typeOrSet(endInput, range.to);
+    } else {
+      // sem inputs → usa clique na célula (navegando pro mês/ano)
+      await ensureMonthYear(page, range.yyyy, range.mm);
+      await clickDayTwice(page, range.dd);
     }
 
-    const stratA = await typeOrSet(startInput, range.from);
-    await page.waitForTimeout(150);
-    const stratB = await typeOrSet(endInput, range.to);
-
-    // aplica o filtro: tecla Enter ou botão OK
+    // aplica: Enter ou botão OK
     let applied = false;
     try { await page.keyboard.press('Enter'); applied = true; } catch {}
     if (!applied) {
@@ -210,67 +319,40 @@ module.exports = async function handler(req, res) {
       if (okBtn) { await okBtn.click().catch(() => {}); applied = true; }
     }
 
-    // aguarda atualização do painel
+    // espera painel atualizar
     await page.waitForTimeout(1000);
     await page.waitForFunction(() => {
-      // presença de tabela ou estatísticas
       const hasTable = document.querySelector('.ant-table, [class*="table"]');
       const hasStat = document.querySelector('.ant-statistic, [class*="statistic"]');
       return !!(hasTable || hasStat);
     }, null, { timeout: 8000 }).catch(() => {});
 
-    // --- coleta KPIs (tentativas comuns na UI do Ant e variações do painel) ---
+    // KPIs
     const kpis = await page.evaluate(() => {
       function pickText(el) { return (el && (el.textContent || '') || '').trim(); }
-      function parseNumberLike(s) {
-        if (!s) return null;
-        // troca ponto de milhar BR e vírgula decimal
-        const norm = s.replace(/\s/g, '').replace(/\./g, '').replace(',', '.').replace(/[^0-9.\-]/g, '');
-        const val = Number(norm);
-        return Number.isFinite(val) ? val : null;
-      }
       const out = {};
-
-      // 1) cards do Ant Statistic
+      // estatísticas
       document.querySelectorAll('.ant-statistic').forEach((card) => {
         const label = pickText(card.querySelector('.ant-statistic-title')) || pickText(card.previousElementSibling);
         const valTxt = pickText(card.querySelector('.ant-statistic-content, .ant-statistic-content-value'));
         if (label && valTxt) out[label.toLowerCase()] = valTxt;
       });
-
-      // 2) títulos/metas rápidas
+      // cards
       document.querySelectorAll('.ant-card .ant-card-meta-title, .ant-card-head-title').forEach((el) => {
         const lbl = pickText(el);
-        const sibling = el.parentElement?.parentElement?.querySelector('.ant-statistic-content, .ant-typography, .ant-card-meta-description');
-        const valTxt = pickText(sibling);
+        const valTxt = pickText(el.closest('.ant-card')?.querySelector('.ant-statistic-content, .ant-typography, .ant-card-meta-description'));
         if (lbl && valTxt) out[lbl.toLowerCase()] = valTxt;
       });
-
-      // 3) possíveis labels comuns
-      const knownLabels = ['faturamento', 'pedidos', 'ticket', 'ticket médio', 'conversão', 'itens por pedido'];
-      knownLabels.forEach((lbl) => {
-        const node = Array.from(document.querySelectorAll('*')).find(n => (n.textContent || '').toLowerCase().includes(lbl));
-        if (node) {
-          // pega o número mais próximo dentro do mesmo bloco
-          const block = node.closest('.ant-card, .ant-statistic, .ant-col, .ant-typography, div');
-          const txt = pickText(block);
-          // última ocorrência de um número dentro do bloco
-          const m = txt.match(/-?\d{1,3}(\.\d{3})*(,\d+)?|R\$\s*\d[\d\.\,]*/g);
-          if (m && !out[lbl]) out[lbl] = m[m.length - 1];
-        }
-      });
-
       // normaliza chaves
       const normalized = {};
       Object.entries(out).forEach(([k, v]) => {
-        const key = k.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-          .replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+        const key = k.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
         normalized[key] = v;
       });
       return normalized;
     });
 
-    // --- coleta amostra da tabela (primeiras 10 linhas x colunas) ---
+    // Tabela (amostra)
     const tableSample = await page.evaluate(() => {
       const table = document.querySelector('.ant-table');
       if (!table) return null;
