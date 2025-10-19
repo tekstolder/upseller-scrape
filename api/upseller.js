@@ -32,8 +32,11 @@ module.exports = async function handler(req, res) {
     const target = 'https://app.upseller.com/pt/analytics/store-sales';
 
     // Carrega a página logada
-    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 90000 });
-    await page.waitForLoadState('networkidle', { timeout: 90000 });
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    // Evita networkidle (pode demorar em apps SPA). Apenas um pequeno delay controlado:
+    await page.waitForTimeout(1200);
+    // para garantir que futuros waits não passem do orçamento:
+    page.setDefaultTimeout(20000);
 
     // 1) Abrir o datepicker (tenta seletores novos/antigos do Ant Design)
     const openerSelectors = [
