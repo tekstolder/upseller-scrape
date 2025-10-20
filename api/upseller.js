@@ -1,179 +1,382 @@
-/**
- * Ajusta o período do Ant Design RangePicker (v3) usando:
- *  1) Atalhos (ex.: "Últimos 30 dias")
- *  2) Clique em datas do calendário (painel flutuante)
- *  3) Fallback escrevendo nos inputs e disparando eventos React
- *
- * Aceita datas "DD/MM/YYYY".
- */
+// api/upseller.js
+// Node 20.x — Serverless on Vercel
+
+import { chromium } from "playwright-core";
+
+function json(res, status, body) {
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(body, null, 2));
+}
+
+function parseDateParams(q) {
+  const from = `${q.d?.padStart?.(2, "0")}/${q.m?.padStart?.(2, "0")}/${q.y}`;
+  const to = from;
+  return { from, to };
+}
+
+// -----------------------------
+// FUNÇÃO: setDateRangeSmart()
+// -----------------------------
 async function setDateRangeSmart(page, fromStr, toStr, opts = {}) {
   const {
-    preferQuickLabel = null,        // ex.: "Últimos 30 dias" (se quiser usar atalho)
-    openSelector = '.ant-calendar-picker', // wrapper que abre o popup
-    popupSelector = '.ant-calendar, .ant-calendar-picker-container',
-    quickSelector = '.ant-calendar-range-quick-selector span',
-    barInputsSelector = '.ant-calendar-range-picker-input', // 2 inputs na barra
-    cellSelector = '.ant-calendar-date', // células de dia
-    okSelector = '.ant-calendar-ok-btn, .ant-calendar-footer .ant-btn-primary',
-    debug = false
+    preferQuickLabel, // ex: "Últimos 30 dias"
+    debug = false,
+    openTimeout = 8000,
   } = opts;
 
-  function dlog(...a) { if (debug) console.log('[RANGE]', ...a); }
+  // abre o dropdown do datepicker
+  const openPicker = async () => {
+    // existem duas abas “Por Data / Por Loja”; usamos o range visível ao lado dos botões de atalho
+    // seletores genéricos (v4 antd ainda usa essas classes)
+    const openerCandidates = [
+      ".ant-calendar-picker",
+      ".ant-picker-range", // ant v4
+      ".ant-calendar-range-picker",
+    ];
+    for (const sel of openerCandidates) {
+      const ok = await page.$(sel);
+      if (ok) {
+        await ok.click({ delay: 40 });
+        return true;
+      }
+    }
+    return false;
+  };
 
-  // 1) Abre o popup do calendar
-  await page.waitForSelector(openSelector, { timeout: 15000 });
-  await page.click(openSelector);
-  await page.waitForSelector(popupSelector, { timeout: 15000 });
-  await page.waitForTimeout(150);
+  // tenta abrir
+  await openPicker();
+  await page.waitForTimeout(200);
 
-  // --- 1a. Tenta por ATALHO (se label for fornecido) -----------------------
+  // 1) quick label (se pedido)
   if (preferQuickLabel) {
-    const clicked = await page.$$eval(
-      quickSelector,
-      (els, label) => {
-        let hit = false;
-        els.forEach(el => {
-          if ((el.textContent || '').trim() === label) {
-            (el.closest('span') || el).click();
-            hit = true;
+    try {
+      await page.waitForSelector(".ant-calendar-range-quick-selector", {
+        timeout: 1500,
+      });
+      const hit = await page.evaluate((label) => {
+        const wraps = document.querySelectorAll(
+          ".ant-calendar-range-quick-selector"
+        );
+        for (const w of wraps) {
+          const spans = w.querySelectorAll("span");
+          for (const s of spans) {
+            if (s.textContent?.trim() === label) {
+              s.click();
+              return true;
+            }
           }
-        });
-        return hit;
-      },
-      preferQuickLabel
-    ).catch(() => false);
-
-    if (clicked) {
-      await page.waitForTimeout(200);
-      // tenta fechar/confirmar
-      const ok = await page.$(okSelector);
-      if (ok) await ok.click().catch(()=>{});
-      await page.waitForTimeout(400);
-      dlog('Selecionado por atalho:', preferQuickLabel);
-      return true;
-    } else {
-      dlog('Atalho não encontrado:', preferQuickLabel);
-    }
-  }
-
-  // --- 1b. Tenta por CLIQUE EM CÉLULAS -------------------------------------
-  // Se o mês/ano não é o atual, navegar meses com botões do Ant pode ser adicionado.
-  // Aqui focamos no clique direto; normalmente o Ant mantém a navegação simples.
-
-  // Parse de DD/MM/YYYY
-  const [d1, m1, y1] = fromStr.split('/').map(n => parseInt(n, 10));
-  const [d2, m2, y2] = toStr.split('/').map(n => parseInt(n, 10));
-
-  // Helper: clica na célula com o dia informado (no calendário visível)
-  async function clickDay(day) {
-    const hit = await page.$$eval(
-      cellSelector,
-      (cells, day) => {
-        const want = String(day);
-        // prefere células "válidas" (sem classes de fora do mês)
-        const valid = [...cells].filter(c => !c.className.includes('ant-calendar-last-month-cell') &&
-                                             !c.className.includes('ant-calendar-next-month-btn-day'));
-        function text(el){return (el.textContent||'').trim();}
-        let clicked = false;
-        for (const el of valid.length ? valid : cells) {
-          if (text(el) === want) { el.click(); clicked = true; break; }
         }
-        return clicked;
-      },
-      day
-    ).catch(() => false);
-    if (!hit) throw new Error(`Dia ${day} não encontrado nas células visíveis`);
+        return false;
+      }, preferQuickLabel);
+
+      if (hit) {
+        if (debug) console.log("Quick label aplicado:", preferQuickLabel);
+        // o painel costuma fechar sozinho; se não, pressiona o botão OK
+        const okBtn =
+          (await page.$(".ant-calendar-ok-btn")) ||
+          (await page.$(".ant-picker-ok button"));
+        if (okBtn) await okBtn.click();
+        await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(
+          () => {}
+        );
+        return true;
+      }
+    } catch (_) {
+      // segue
+    }
   }
 
-  try {
-    // clica data inicial e depois final
-    await clickDay(d1);
-    await page.waitForTimeout(200);
-    await clickDay(d2);
-    await page.waitForTimeout(200);
+  // 2) digitar nos inputs (removendo readonly + disparando evento React)
+  // garante que o dropdown está aberto
+  if (!(await page.$(".ant-calendar-range, .ant-picker-dropdown"))) {
+    await openPicker();
+    await page.waitForSelector(".ant-calendar-range, .ant-picker-dropdown", {
+      timeout: openTimeout,
+    });
+  }
 
-    // confirma se houver botão
-    const ok = await page.$(okSelector);
-    if (ok) {
-      await ok.click().catch(()=>{});
-      await page.waitForTimeout(300);
-    } else {
-      // fallback com Enter
-      await page.keyboard.press('Enter').catch(()=>{});
-      await page.waitForTimeout(150);
-      await page.keyboard.press('Enter').catch(()=>{});
-      await page.waitForTimeout(200);
-    }
-
-    dlog('Selecionado por clique nas células:', fromStr, toStr);
-  } catch (e) {
-    dlog('Clique em células falhou, tentando inputs. Motivo:', e.message);
-
-    // --- 1c. Fallback: escreve nos INPUTS da barra + eventos React ----------
-    await page.click(openSelector).catch(()=>{}); // garante aberto
-    await page.waitForSelector(barInputsSelector, { timeout: 8000 });
-
-    const fillBar = await page.$$eval(
-      barInputsSelector,
-      (els, from, to) => {
-        if (!els || els.length < 2) return false;
-
-        const [start, end] = els;
-
-        function setReactValue(el, value) {
-          el.removeAttribute('readonly');
-          const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+  const typedOk = await page
+    .evaluate(
+      ({ fromStr, toStr }) => {
+        function dispatchReactInput(el, value) {
+          const desc = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype,
+            "value"
+          );
           desc.set.call(el, value);
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-          el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter', code: 'Enter', which: 13, keyCode: 13 }));
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.blur?.();
         }
 
-        setReactValue(start, from);
-        setReactValue(end, to);
-        return { start: start.value, end: end.value };
+        // aceita v3 (ant-calendar-*) e v4 (ant-picker-*)
+        const inputs =
+          document.querySelectorAll(".ant-calendar-range-picker-input") ??
+          [];
+        const inputsV4 =
+          document.querySelectorAll(".ant-picker-range input") ?? [];
+
+        let start, end;
+        if (inputs.length >= 2) {
+          [start, end] = [inputs[0], inputs[1]];
+        } else if (inputsV4.length >= 2) {
+          [start, end] = [inputsV4[0], inputsV4[1]];
+        } else {
+          return false;
+        }
+
+        // remove readonly enquanto digita
+        start.removeAttribute("readonly");
+        end.removeAttribute("readonly");
+        dispatchReactInput(start, fromStr);
+        dispatchReactInput(end, toStr);
+
+        // restaura readonly
+        start.setAttribute("readonly", "true");
+        end.setAttribute("readonly", "true");
+
+        return true;
       },
-      fromStr,
-      toStr
-    ).catch(() => false);
+      { fromStr, toStr }
+    )
+    .catch(() => false);
 
-    if (!fillBar || !fillBar.start || !fillBar.end) {
-      throw new Error('Falha ao preencher inputs do range');
-    }
+  if (typedOk) {
+    // fecha/ok caso necessário
+    const okBtn =
+      (await page.$(".ant-calendar-ok-btn")) ||
+      (await page.$(".ant-picker-ok button"));
+    if (okBtn) await okBtn.click().catch(() => {});
+    await page.waitForTimeout(400);
+    return true;
+  }
 
-    // confirma
-    const ok2 = await page.$(okSelector);
-    if (ok2) {
-      await ok2.click().catch(()=>{});
+  // 3) fallback: clicar dias (mesmo mês)
+  const [d1, m1, y1] = fromStr.split("/").map((v) => parseInt(v, 10));
+  const [d2, m2, y2] = toStr.split("/").map((v) => parseInt(v, 10));
+  if (y1 === y2 && m1 === m2) {
+    try {
+      // garante dropdown
+      if (!(await page.$(".ant-calendar-range, .ant-picker-dropdown"))) {
+        await openPicker();
+      }
+      await page.waitForSelector(".ant-calendar-date, .ant-picker-cell", {
+        timeout: openTimeout,
+      });
+
+      // clica dia inicial
+      await page.evaluate((d) => {
+        const pickers = document.querySelectorAll(".ant-calendar-date");
+        for (const el of pickers) {
+          if (el.textContent?.trim() === String(d)) {
+            el.click();
+            break;
+          }
+        }
+      }, d1);
+      await page.waitForTimeout(250);
+
+      // clica dia final
+      await page.evaluate((d) => {
+        const pickers = document.querySelectorAll(".ant-calendar-date");
+        for (const el of pickers) {
+          if (el.textContent?.trim() === String(d)) {
+            el.click();
+            break;
+          }
+        }
+      }, d2);
+
+      const okBtn =
+        (await page.$(".ant-calendar-ok-btn")) ||
+        (await page.$(".ant-picker-ok button"));
+      if (okBtn) await okBtn.click().catch(() => {});
       await page.waitForTimeout(300);
-    } else {
-      await page.keyboard.press('Enter').catch(()=>{});
-      await page.waitForTimeout(150);
-      await page.keyboard.press('Enter').catch(()=>{});
-      await page.waitForTimeout(200);
+      return true;
+    } catch {
+      // segue
+    }
+  }
+
+  return false;
+}
+
+// ---------------------------------
+// NORMALIZAÇÃO de texto de header
+// ---------------------------------
+function norm(s) {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ---------------------------------
+// GRUPOS e ORDENACAO
+// ---------------------------------
+function groupAndSort(rows) {
+  // rows: [{ loja, pedidosValidos, valorVendasValidas }]
+  const MELI = [];
+  const SPEE = [];
+  for (const r of rows) {
+    const tag = (r.loja || "").toUpperCase();
+    if (tag.includes("MELI")) MELI.push(r);
+    else if (tag.includes("SPEE")) SPEE.push(r);
+  }
+  const byValueDesc = (a, b) => (b.valorVendasValidas || 0) - (a.valorVendasValidas || 0);
+  MELI.sort(byValueDesc);
+  SPEE.sort(byValueDesc);
+  return {
+    MELI: MELI.slice(0, 7),
+    SPEE: SPEE.slice(0, 7),
+  };
+}
+
+// ---------------------------------
+// HANDLER
+// ---------------------------------
+export default async function handler(req, res) {
+  const started = Date.now();
+  try {
+    const { query } = req;
+    const range = parseDateParams(query);
+    const preferQuickLabel = query.quick || ""; // opcional
+
+    // Ping simples (sem browser)
+    if (query.ping != null) {
+      return json(res, 200, { ok: true, ping: "alive", hasWS: !!process.env.BROWSERLESS_WS });
     }
 
-    dlog('Selecionado via inputs do range:', fillBar);
+    // Conecta no Browserless
+    const WS = process.env.BROWSERLESS_WS;
+    if (!WS) return json(res, 500, { ok: false, error: "BROWSERLESS_WS não definido" });
+
+    const browser = await chromium.connectOverCDP(WS);
+    const context = await browser.newContext();
+
+    // cookies (opcional)
+    try {
+      const raw = process.env.UPS_COOKIES_JSON || "[]";
+      const cookies = JSON.parse(raw);
+      if (Array.isArray(cookies) && cookies.length) {
+        await context.addCookies(
+          cookies.map((c) => ({
+            ...c,
+            sameSite: c.sameSite || "Lax",
+            secure: true,
+          }))
+        );
+      }
+    } catch (_) {
+      // segue sem cookies
+    }
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(20000);
+
+    const target = "https://app.upseller.com/pt/analytics/store-sales";
+    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForLoadState("load", { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(600);
+
+    // HTML bruto de diagnóstico
+    if (query.html != null) {
+      const html = await page.content();
+      const diag = {
+        title: await page.title().catch(() => null),
+        url: page.url(),
+        len: html?.length || 0,
+      };
+      await context.close();
+      await browser.close();
+      return json(res, 200, { ok: true, diag, html });
+    }
+
+    // Aplica o período
+    const applied = await setDateRangeSmart(page, range.from, range.to, {
+      preferQuickLabel: preferQuickLabel || undefined,
+      debug: false,
+    });
+
+    if (!applied) {
+      throw new Error("Datepicker não encontrado");
+    }
+
+    // Aguarda tabela renderizar
+    await page.waitForSelector(".ant-table", { timeout: 12000 }).catch(() => {});
+    await page.waitForTimeout(800);
+
+    // Extrai cabeçalhos + linhas (texto)
+    const tableRaw = await page.evaluate(() => {
+      const tbl = document.querySelector(".ant-table");
+      if (!tbl) return null;
+
+      const headers = Array.from(tbl.querySelectorAll("thead th")).map((th) =>
+        (th.textContent || "").trim()
+      );
+
+      const rows = Array.from(tbl.querySelectorAll("tbody tr")).map((tr) =>
+        Array.from(tr.querySelectorAll("td")).map((td) => (td.textContent || "").trim())
+      );
+
+      return { headers, rows };
+    });
+
+    if (!tableRaw || !tableRaw.headers?.length) {
+      throw new Error("Tabela não encontrada/sem cabeçalhos");
+    }
+
+    // Descobre índices das colunas de interesse (normalizando)
+    const H = tableRaw.headers.map(norm);
+    const idxLoja = H.findIndex((h) => h.startsWith("loja"));
+    const idxPedidosValidos = H.findIndex((h) => h.includes("pedidos validos"));
+    const idxVendasValidas = H.findIndex((h) => h.includes("valor de vendas validas"));
+
+    if (idxLoja < 0 || idxPedidosValidos < 0 || idxVendasValidas < 0) {
+      throw new Error(
+        `Colunas não localizadas. headers norm: ${JSON.stringify(H)}`
+      );
+    }
+
+    // Converte linhas -> objetos já parseando números BR
+    const toNumberBR = (txt) => {
+      // exemplos: "3.683,65" → 3683.65
+      if (typeof txt !== "string") return 0;
+      const t = txt.replace(/\./g, "").replace(",", ".");
+      const n = parseFloat(t);
+      return Number.isFinite(n) ? n : 0;
+    };
+
+    const parsedRows = tableRaw.rows.map((cols) => {
+      const loja = cols[idxLoja] || "";
+      const pedidosValidos = toNumberBR(cols[idxPedidosValidos]);
+      const valorVendasValidas = toNumberBR(cols[idxVendasValidas]);
+      return { loja, pedidosValidos, valorVendasValidas };
+    });
+
+    // Agrupa (MELI / SPEE), ordena e pega top-7
+    const groups = groupAndSort(parsedRows);
+
+    const tookMs = Date.now() - started;
+    await context.close();
+    await browser.close();
+
+    return json(res, 200, {
+      ok: true,
+      period: { from: range.from, to: range.to },
+      page: { title: await page.title().catch(() => null), url: target },
+      groups,
+      tookMs,
+    });
+  } catch (err) {
+    const tookMs = Date.now() - started;
+    return json(res, 200, {
+      ok: false,
+      error: String(err?.message || err),
+      tookMs,
+    });
   }
-
-  // --- 2) Verificação: lê os inputs para garantir que ficaram corretos ------
-  const got = await page.$$eval(
-    barInputsSelector,
-    els => (els && els.length >= 2) ? { from: els[0].value || '', to: els[1].value || '' } : null
-  ).catch(() => null);
-
-  if (!got || !got.from || !got.to) {
-    throw new Error('Inputs do date-range não encontrados após seleção');
-  }
-
-  // normaliza (remove zeros à esquerda em dia/mês para comparação mais “humana”)
-  function norm(s){ return s.replace(/^0/,'').replace(/\/0/,'/'); }
-  if (norm(got.from) !== norm(fromStr) || norm(got.to) !== norm(toStr)) {
-    dlog('Aviso: período lido difere do esperado', got, { fromStr, toStr });
-    // Nem sempre é erro: às vezes o produto “corrige” para a janela válida.
-  }
-
-  // Espera a tela atualizar KPIs/tabela
-  await page.waitForTimeout(600);
-  return true;
 }
